@@ -1,10 +1,12 @@
 mod engine;
+mod net;
 mod tabs;
 
 slint::include_modules!();
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use slint::{ModelRc, VecModel};
 use tabs::{TabId, TabManager, TabState};
@@ -12,12 +14,31 @@ use tabs::{TabId, TabManager, TabState};
 const MAX_ACTIVE_TABS: usize = 8;
 const VIEWPORT: (u32, u32) = (1000, 560);
 
-fn placeholder_html(url: &str) -> String {
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Pages served locally, without a network round-trip.
+fn local_page_html(url: &str) -> Option<String> {
+    match url {
+        "melora://start" => Some(
+            "<html><body><h1>Melora</h1><p>Type an address above and press Go. This start \
+             page is generated locally; it is not fetched over the network.</p></body></html>"
+                .to_string(),
+        ),
+        "melora://new-tab" => Some(
+            "<html><body><h1>New Tab</h1><p>Type an address above and press Go.</p></body></html>"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn error_page_html(target: &str, message: &str) -> String {
     format!(
-        "<html><body><h1>{url}</h1><p>Melora's parse/style/layout pipeline (html5ever + \
-         Stylo + Taffy, assembled via Blitz) ran successfully for this address. Network \
-         fetching and on-screen page painting are not wired up yet — see ARCHITECTURE.md.</p>\
-         </body></html>"
+        "<html><body><h1>Couldn't load {}</h1><p>{}</p></body></html>",
+        html_escape(target),
+        html_escape(message)
     )
 }
 
@@ -55,17 +76,86 @@ fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) 
     }
 }
 
+/// Starts loading `intent`'s target into tab `id`. A `melora://` page is
+/// applied immediately (no network needed); anything else is handed to the
+/// network layer, and the result is applied later, when the timer loop in
+/// `main` drains it.
+fn start_load(
+    id: TabId,
+    intent: net::NavIntent,
+    network: &net::Network,
+    manager: &Rc<RefCell<TabManager>>,
+    window: &MainWindow,
+) {
+    let target = intent.target().to_string();
+
+    if let Some(html) = local_page_html(&target) {
+        let mut mgr = manager.borrow_mut();
+        intent.apply(&mut mgr, id, &html);
+        drop(mgr);
+        refresh(window, &manager.borrow(), Some(id));
+        return;
+    }
+
+    match net::resolve_typed_url(&target) {
+        Ok(url) => {
+            window.set_status_text(format!("Loading {target}…").into());
+            network.fetch(id, url, intent);
+        }
+        Err(message) => {
+            let mut mgr = manager.borrow_mut();
+            intent.apply(&mut mgr, id, &error_page_html(&target, &message));
+            drop(mgr);
+            refresh(window, &manager.borrow(), Some(id));
+        }
+    }
+}
+
 fn main() {
     let window = MainWindow::new().unwrap();
     let manager = Rc::new(RefCell::new(TabManager::new(MAX_ACTIVE_TABS, VIEWPORT)));
     let active_id = Rc::new(Cell::new(None::<TabId>));
+    let (network, net_results) = net::Network::spawn();
+    let network = Rc::new(network);
 
     {
         let mut mgr = manager.borrow_mut();
-        let id = mgr.open_tab("melora://start", &placeholder_html("melora://start"));
+        let id = mgr.open_tab("melora://start", &local_page_html("melora://start").unwrap());
         active_id.set(Some(id));
     }
     refresh(&window, &manager.borrow(), active_id.get());
+
+    // Drains completed network fetches on the UI thread and applies them --
+    // the background network thread never touches TabManager or Slint
+    // directly, since neither is `Send`. See net.rs.
+    let timer = slint::Timer::default();
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(50),
+            move || {
+                let Some(window) = window_weak.upgrade() else {
+                    return;
+                };
+                let mut applied = false;
+                while let Ok((id, intent, outcome)) = net_results.try_recv() {
+                    let mut mgr = manager.borrow_mut();
+                    let html = match outcome {
+                        net::FetchOutcome::Ok { bytes } => String::from_utf8_lossy(&bytes).into_owned(),
+                        net::FetchOutcome::Err { message } => error_page_html(intent.target(), &message),
+                    };
+                    intent.apply(&mut mgr, id, &html);
+                    applied = true;
+                }
+                if applied {
+                    refresh(&window, &manager.borrow(), active_id.get());
+                }
+            },
+        );
+    }
 
     {
         let window_weak = window.as_weak();
@@ -74,7 +164,7 @@ fn main() {
         window.on_new_tab(move || {
             let window = window_weak.unwrap();
             let mut mgr = manager.borrow_mut();
-            let id = mgr.open_tab("melora://new-tab", &placeholder_html("melora://new-tab"));
+            let id = mgr.open_tab("melora://new-tab", &local_page_html("melora://new-tab").unwrap());
             active_id.set(Some(id));
             refresh(&window, &mgr, active_id.get());
         });
@@ -100,14 +190,25 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let network = network.clone();
         window.on_activate_tab(move |id| {
             let window = window_weak.unwrap();
-            let mut mgr = manager.borrow_mut();
             let id = id as TabId;
-            let url = mgr.tab(id).map(|t| t.url.clone()).unwrap_or_default();
-            mgr.activate(id, &placeholder_html(&url));
             active_id.set(Some(id));
-            refresh(&window, &mgr, active_id.get());
+
+            let needs_wake = manager
+                .borrow()
+                .tab(id)
+                .map(|t| t.state == TabState::Hibernated)
+                .unwrap_or(false);
+
+            if needs_wake {
+                let url = manager.borrow().tab(id).map(|t| t.url.clone()).unwrap_or_default();
+                start_load(id, net::NavIntent::Wake(url), &network, &manager, &window);
+            } else {
+                manager.borrow_mut().activate(id, "");
+                refresh(&window, &manager.borrow(), active_id.get());
+            }
         });
     }
 
@@ -115,15 +216,12 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let network = network.clone();
         window.on_navigate(move |text| {
             let window = window_weak.unwrap();
-            let mut mgr = manager.borrow_mut();
             if let Some(id) = active_id.get() {
-                let url = text.to_string();
-                let html = placeholder_html(&url);
-                mgr.navigate(id, url, &html);
+                start_load(id, net::NavIntent::Navigate(text.to_string()), &network, &manager, &window);
             }
-            refresh(&window, &mgr, active_id.get());
         });
     }
 
@@ -131,15 +229,13 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let network = network.clone();
         window.on_reload(move || {
             let window = window_weak.unwrap();
-            let mut mgr = manager.borrow_mut();
             if let Some(id) = active_id.get() {
-                let url = mgr.tab(id).map(|t| t.url.clone()).unwrap_or_default();
-                let html = placeholder_html(&url);
-                mgr.reload(id, &html);
+                let url = manager.borrow().tab(id).map(|t| t.url.clone()).unwrap_or_default();
+                start_load(id, net::NavIntent::Reload(url), &network, &manager, &window);
             }
-            refresh(&window, &mgr, active_id.get());
         });
     }
 
@@ -147,15 +243,14 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let network = network.clone();
         window.on_go_back(move || {
             let window = window_weak.unwrap();
-            let mut mgr = manager.borrow_mut();
             if let Some(id) = active_id.get() {
-                let url = mgr.tab(id).map(|t| t.url.clone()).unwrap_or_default();
-                let html = placeholder_html(&url);
-                mgr.go_back(id, &html);
+                if let Some(target) = manager.borrow().peek_back_url(id) {
+                    start_load(id, net::NavIntent::Back(target), &network, &manager, &window);
+                }
             }
-            refresh(&window, &mgr, active_id.get());
         });
     }
 
@@ -163,15 +258,14 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let network = network.clone();
         window.on_go_forward(move || {
             let window = window_weak.unwrap();
-            let mut mgr = manager.borrow_mut();
             if let Some(id) = active_id.get() {
-                let url = mgr.tab(id).map(|t| t.url.clone()).unwrap_or_default();
-                let html = placeholder_html(&url);
-                mgr.go_forward(id, &html);
+                if let Some(target) = manager.borrow().peek_forward_url(id) {
+                    start_load(id, net::NavIntent::Forward(target), &network, &manager, &window);
+                }
             }
-            refresh(&window, &mgr, active_id.get());
         });
     }
 

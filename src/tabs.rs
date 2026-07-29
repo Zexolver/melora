@@ -136,6 +136,23 @@ impl TabManager {
             .is_some_and(|t| t.history_pos + 1 < t.history.len())
     }
 
+    /// The URL `go_back` would load, without applying anything. Lets a
+    /// caller fetch that URL's content first (e.g. over the network) and
+    /// only then call `go_back` with the result in hand.
+    pub fn peek_back_url(&self, id: TabId) -> Option<String> {
+        self.tabs.iter().find(|t| t.id == id).and_then(|t| {
+            (t.history_pos > 0).then(|| t.history[t.history_pos - 1].clone())
+        })
+    }
+
+    /// The URL `go_forward` would load, without applying anything. See
+    /// `peek_back_url`.
+    pub fn peek_forward_url(&self, id: TabId) -> Option<String> {
+        self.tabs.iter().find(|t| t.id == id).and_then(|t| {
+            (t.history_pos + 1 < t.history.len()).then(|| t.history[t.history_pos + 1].clone())
+        })
+    }
+
     pub fn go_back(&mut self, id: TabId, html: &str) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
             return;
@@ -270,6 +287,23 @@ mod tests {
 
         mgr.go_forward(a, DEMO);
         assert_eq!(mgr.tab(a).unwrap().url, "b");
+    }
+
+    #[test]
+    fn peek_back_and_forward_report_the_target_without_mutating_state() {
+        let mut mgr = TabManager::new(4, (800, 600));
+        let a = mgr.open_tab("a", DEMO);
+        mgr.navigate(a, "b", DEMO);
+        mgr.navigate(a, "c", DEMO);
+
+        assert_eq!(mgr.peek_back_url(a).as_deref(), Some("b"));
+        assert_eq!(mgr.peek_forward_url(a), None);
+        // Peeking must not have moved history_pos.
+        assert_eq!(mgr.tab(a).unwrap().url, "c");
+
+        mgr.go_back(a, DEMO);
+        assert_eq!(mgr.peek_back_url(a).as_deref(), Some("a"));
+        assert_eq!(mgr.peek_forward_url(a).as_deref(), Some("c"));
     }
 
     #[test]

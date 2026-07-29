@@ -88,27 +88,54 @@ independently testable component — see the `hundreds_of_tabs_stay_within_the_a
 test in `src/tabs.rs`, which opens 300 tabs and asserts only the budgeted
 few stay resident.
 
-## What's stubbed, and why
+## Networking
 
-- **Networking.** Tabs currently render a generated placeholder page
-  describing what would happen, rather than fetching the real URL. Wiring
-  up `blitz-net` (which exists and would provide this) needs an async
-  runtime and a `NetProvider` implementation plumbed through `TabManager`;
-  that's a real chunk of work and was left as a clearly-marked next step
-  rather than faked.
-- **Painting.** The content pane currently shows layout stats as text.
-  Rendering the actual laid-out page requires `blitz-paint` (or
+`src/net.rs` wires up real HTTP(S) fetching via `blitz-net`, replacing the
+generated placeholder pages from the first scaffold. The interesting part
+isn't the fetch itself, it's the thread boundary: `blitz-net` needs a tokio
+runtime, and Slint's UI event loop is single-threaded and holds types that
+aren't `Send`. `Network::spawn` owns a dedicated OS thread running a tokio
+runtime that does the actual fetching; only `Send`-safe data (a `TabId`,
+the target `Url`, the resulting bytes, and a `NavIntent` describing which
+`TabManager` method to call once the fetch lands) ever crosses the thread
+boundary. `main.rs` drains completed fetches on the UI thread with a
+`slint::Timer`, where it's safe to touch `TabManager` and Slint's
+generated types. This is proven end-to-end by a test in `src/net.rs`
+(`fetch_result_flows_through_to_a_navigated_tab`) that runs the real
+background thread and fetch pipeline against a `file://` URL — hermetic,
+so it doesn't depend on network access being available wherever it runs —
+and by manual testing against real HTTP(S) URLs.
+
+`melora://start` and `melora://new-tab` stay locally generated (no fetch);
+everything else goes through the network layer, including reload,
+back/forward, and waking a hibernated tab (which now genuinely re-fetches,
+matching what Chrome's tab discarding actually does on reactivation,
+rather than regenerating a placeholder).
+
+## What's still stubbed, and why
+
+- **Painting.** The content pane still shows layout stats as text instead
+  of the rendered page. Actually drawing it requires `blitz-paint` (or
   `anyrender`) rasterizing into a pixel buffer that gets blitted into a
   Slint `Image` element each frame. This is the next concrete milestone —
-  the parse/style/layout side is already proven to work (see
-  `src/engine.rs`); only the raster-to-Slint-surface step remains.
+  the parse/style/layout side is proven to work end-to-end against real
+  fetched pages now, not just static strings; only the raster-to-Slint-
+  surface step remains.
+- **Sub-resources.** Only the top-level HTML document is fetched. Images,
+  external stylesheets, and fonts referenced from that HTML aren't loaded
+  yet — that needs wiring `blitz-dom`'s resource-loading dispatch (the
+  `doc_id`/`NetHandler` machinery `blitz-net`'s `NetProvider::fetch` trait
+  method is actually designed for, which this milestone deliberately
+  sidestepped by using the simpler `fetch_async` for just the top-level
+  document).
 
 ## Roadmap (rough order)
 
-1. Wire `blitz-net` for real HTTP(S) fetching, replacing the placeholder
-   HTML generator.
-2. Rasterize the laid-out document (via `blitz-paint`) into a buffer and
+1. Rasterize the laid-out document (via `blitz-paint`) into a buffer and
    display it in the Slint content pane, replacing the text stats view.
+2. Wire sub-resource loading (images, external CSS, fonts) through
+   `blitz-dom`'s resource dispatch, now that the top-level fetch exists to
+   model it on.
 3. Forward input events (mouse, scroll, keyboard) from the Slint content
    area into `blitz-dom`'s hit-testing/event handling, so pages become
    interactive.

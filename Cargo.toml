@@ -9,6 +9,8 @@ slint = "1"
 blitz-dom = "0.1"
 blitz-html = "0.1"
 blitz-traits = "0.1"
+blitz-net = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [build-dependencies]
 slint-build = "1"

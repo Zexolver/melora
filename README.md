@@ -28,6 +28,11 @@ This is an early scaffold, not a daily driver yet. What works today:
   including one that opens 300 tabs and checks only the budgeted few stay
   resident.
 - Per-tab back/forward history.
+- Real HTTP(S) fetching (`src/net.rs`, via `blitz-net`): typing an address,
+  reload, back/forward, and waking a hibernated tab all genuinely fetch the
+  page over the network now, off the UI thread. See ARCHITECTURE.md for
+  how it bridges tokio (which the fetch needs) to Slint's UI loop (which
+  can't touch anything from another thread).
 - A second engine candidate, [gosub-engine](https://github.com/gosub-io/gosub-engine)
   (MIT, actively developed), evaluated via a real dependency and test
   (`tests/gosub_html5_smoke.rs`) — its own from-scratch HTML5 parser
@@ -35,10 +40,11 @@ This is an early scaffold, not a daily driver yet. What works today:
 
 What's not wired up yet — see the roadmap in ARCHITECTURE.md:
 
-- Real network fetching (pages are currently a generated placeholder, not
-  the actual site at the URL you type).
 - Painting the laid-out page to pixels inside the content area (the pane
-  currently shows layout stats as text, not the rendered page).
+  currently shows layout stats as text, not the rendered page, even though
+  it's now real fetched content being parsed and laid out).
+- Sub-resources: images, external stylesheets, and fonts referenced from a
+  page aren't fetched yet, only the top-level HTML document.
 
 ## Building
 
