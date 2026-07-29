@@ -53,6 +53,20 @@ impl Tab {
     pub fn compressed_bytes(&self) -> usize {
         self.compressed_html.as_ref().map(Vec::len).unwrap_or(0)
     }
+
+    /// Rasterized RGBA8 pixels of the page as currently scrolled, or
+    /// `None` if this tab has no live engine (compressed, or never
+    /// loaded).
+    pub fn paint(&self) -> Option<Vec<u8>> {
+        self.engine.as_ref().map(PageEngine::paint)
+    }
+
+    /// Scrolls the page; a no-op if this tab has no live engine.
+    pub fn scroll_by(&mut self, dx: f64, dy: f64) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.scroll_by(dx, dy);
+        }
+    }
 }
 
 /// Owns every open tab and decides which ones keep a live [`PageEngine`]
@@ -89,6 +103,7 @@ impl TabManager {
         let id = self.next_id;
         self.next_id += 1;
         let url = url.into();
+        let engine = PageEngine::from_html(html, &url, self.viewport);
         self.tabs.push(Tab {
             id,
             title: url.clone(),
@@ -96,7 +111,7 @@ impl TabManager {
             state: TabState::Active,
             history: vec![url],
             history_pos: 0,
-            engine: Some(PageEngine::from_html(html, self.viewport)),
+            engine: Some(engine),
             source_html: Some(html.as_bytes().to_vec()),
             compressed_html: None,
         });
@@ -116,7 +131,7 @@ impl TabManager {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.url = url.to_string();
             tab.title = url.to_string();
-            tab.engine = Some(PageEngine::from_html(html, self.viewport));
+            tab.engine = Some(PageEngine::from_html(html, url, self.viewport));
             tab.source_html = Some(html.as_bytes().to_vec());
             tab.compressed_html = None;
             tab.state = TabState::Active;
@@ -139,6 +154,7 @@ impl TabManager {
             return WakeResult::AlreadyActive;
         }
 
+        let url = tab.url.clone();
         let Some(compressed) = tab.compressed_html.take() else {
             return WakeResult::NeedsRefetch;
         };
@@ -146,7 +162,7 @@ impl TabManager {
             return WakeResult::NeedsRefetch;
         };
         let html = String::from_utf8_lossy(&bytes).into_owned();
-        let engine = PageEngine::from_html(&html, self.viewport);
+        let engine = PageEngine::from_html(&html, &url, self.viewport);
 
         let tab = self.tabs.iter_mut().find(|t| t.id == id).unwrap();
         tab.engine = Some(engine);
@@ -214,6 +230,14 @@ impl TabManager {
         self.tabs.iter().find(|t| t.id == id).and_then(|t| {
             (t.history_pos + 1 < t.history.len()).then(|| t.history[t.history_pos + 1].clone())
         })
+    }
+
+    /// Scrolls the given tab's page, if it has a live engine. See
+    /// `PageEngine::scroll_by` for the sign convention.
+    pub fn scroll_active(&mut self, id: TabId, dx: f64, dy: f64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.scroll_by(dx, dy);
+        }
     }
 
     pub fn go_back(&mut self, id: TabId, html: &str) {

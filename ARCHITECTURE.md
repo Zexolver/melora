@@ -178,37 +178,83 @@ and by manual testing against real HTTP(S) URLs.
 
 `melora://start` and `melora://new-tab` stay locally generated (no fetch);
 everything else goes through the network layer, including reload,
-back/forward, and waking a hibernated tab (which now genuinely re-fetches,
-matching what Chrome's tab discarding actually does on reactivation,
-rather than regenerating a placeholder).
+back/forward, and (only as a fallback -- see Tab compression above) waking
+a tab whose local snapshot is somehow missing.
+
+## Painting
+
+`PageEngine::paint` (`src/engine.rs`) rasterizes the current, already-laid-
+out document to a straight-alpha RGBA8 buffer via `blitz-paint` +
+`anyrender_vello_cpu` -- a CPU-only Vello backend, chosen specifically so
+this doesn't need a GPU surface or window handle: it just produces plain
+bytes, which keeps `PageEngine` decoupled from whatever UI toolkit ends up
+displaying them (relevant given Slint has a documented iced fallback --
+see Platform scope). `main.rs` wraps that buffer as a
+`slint::SharedPixelBuffer<Rgba8Pixel>` / `slint::Image` and sets it on the
+content pane's `Image` element, replacing the layout-stats text the
+previous milestone showed. The pixel format needed no conversion --
+verified empirically (render a single known-color div, inspect the byte
+at its center) before writing a line of integration code, rather than
+assumed from documentation.
+
+Scrolling works the same way: a `TouchArea`'s `scroll-event` in
+`melora.slint` forwards wheel deltas to `PageEngine::scroll_by`
+(`blitz_dom::BaseDocument::scroll_viewport_by`), and the page is
+repainted. The sign convention took an empirical pass to get right too --
+`scroll_viewport_by`'s `dy` moves the *content*, not the viewport, so a
+downward scroll (which should reveal content *below*) needs a *negative*
+`dy`; this is documented on `PageEngine::scroll_by` and covered by
+`scrolling_down_changes_what_is_painted` in `src/engine.rs`.
+
+**A real bug this surfaced:** the first version of this milestone crashed
+immediately on real pages -- `PageEngine::from_html` never set
+`DocumentConfig::base_url`, so the moment a page's parser hit a relative
+`<link href="/static/...">` (i.e. almost any real page), `blitz-dom`
+panicked trying to resolve it against a missing base URL. This wasn't
+caught by any unit test, because every test up to that point used
+self-contained HTML with no relative references. It was caught by actually
+running the built app under Xvfb, driving it with `xdotool` (typing a real
+URL, clicking Go), and screenshotting the result via `xwd` -- which is
+also how the fix was confirmed: same live app, same URL
+(`https://pypi.org/`), before showing the panic's stack trace and after
+showing the real, live-fetched PyPI homepage, unstyled (no CSS fetched
+yet, see below) but genuinely rendered, followed by a working scroll down
+to its real footer. `PageEngine::from_html` now takes the page's URL and
+threads it into `config.base_url`; `resolves_relative_hrefs_against_the_page_url_instead_of_panicking`
+in `src/engine.rs` is the regression test.
 
 ## What's still stubbed, and why
 
-- **Painting.** The content pane still shows layout stats as text instead
-  of the rendered page. Actually drawing it requires `blitz-paint` (or
-  `anyrender`) rasterizing into a pixel buffer that gets blitted into a
-  Slint `Image` element each frame. This is the next concrete milestone —
-  the parse/style/layout side is proven to work end-to-end against real
-  fetched pages now, not just static strings; only the raster-to-Slint-
-  surface step remains.
 - **Sub-resources.** Only the top-level HTML document is fetched. Images,
   external stylesheets, and fonts referenced from that HTML aren't loaded
-  yet — that needs wiring `blitz-dom`'s resource-loading dispatch (the
-  `doc_id`/`NetHandler` machinery `blitz-net`'s `NetProvider::fetch` trait
-  method is actually designed for, which this milestone deliberately
-  sidestepped by using the simpler `fetch_async` for just the top-level
-  document).
+  yet -- which is why a live-rendered page currently looks unstyled (real
+  content, browser/user-agent-default styling only). Fixing this needs
+  wiring `blitz-dom`'s resource-loading dispatch (the `doc_id`/`NetHandler`
+  machinery `blitz-net`'s `NetProvider::fetch` trait method is actually
+  designed for, which the networking milestone deliberately sidestepped by
+  using the simpler `fetch_async` for just the top-level document). This is
+  the single biggest remaining gap between "renders real content" and
+  "looks like the real site."
+- **No interactivity beyond scroll.** Clicking a link doesn't navigate.
+  `blitz_dom::BaseDocument::hit(x, y)` (hit-testing) and `Node::attr` (to
+  read `href` off the hit element or its ancestors) are both available and
+  unused so far -- the natural next step, not a redesign.
+- **Fixed viewport, not responsive.** `PageEngine` renders at a constant
+  size (`VIEWPORT` in `main.rs`); the Slint `Image` stretches
+  (`image-fit: fill`) to whatever the content pane's actual on-screen size
+  is, which means resizing the window scales the bitmap instead of
+  re-laying-out the page at the new size. Correct, but not how a real
+  browser feels when resized.
 
 ## Roadmap (rough order)
 
-1. Rasterize the laid-out document (via `blitz-paint`) into a buffer and
-   display it in the Slint content pane, replacing the text stats view.
-2. Wire sub-resource loading (images, external CSS, fonts) through
-   `blitz-dom`'s resource dispatch, now that the top-level fetch exists to
-   model it on.
-3. Forward input events (mouse, scroll, keyboard) from the Slint content
-   area into `blitz-dom`'s hit-testing/event handling, so pages become
-   interactive.
+1. Wire sub-resource loading (images, external CSS, fonts) through
+   `blitz-dom`'s resource dispatch -- this is what makes rendered pages
+   look like the real site instead of unstyled content.
+2. Click-to-navigate: hit-test on click, walk up to the nearest `<a href>`,
+   resolve it against the page's base URL, and navigate.
+3. Re-layout (not just re-rasterize) on window resize, matching
+   `PageEngine`'s viewport to the content pane's actual size.
 4. Persist compressed-tab snapshots to disk so a session with hundreds of
    tabs survives a restart without re-fetching everything at once.
 5. Revisit memory/CPU budgets with real profiling data instead of the

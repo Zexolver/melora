@@ -10,8 +10,11 @@ blitz-dom = "0.1"
 blitz-html = "0.1"
 blitz-traits = "0.1"
 blitz-net = "0.1"
+blitz-paint = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 lz4_flex = "0.11"
+anyrender = "0.5"
+anyrender_vello_cpu = "0.6"
 
 [build-dependencies]
 slint-build = "1"

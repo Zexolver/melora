@@ -52,6 +52,21 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Rasterizes the active tab's page and wraps it as a Slint image. Falls
+/// back to a blank white frame if there's no active tab or (shouldn't
+/// normally happen) it has no live engine, rather than showing stale
+/// pixels from whatever was painted last.
+fn render_page_image(manager: &TabManager, active_id: Option<TabId>) -> slint::Image {
+    let pixels = active_id.and_then(|id| manager.tab(id)).and_then(|tab| tab.paint());
+
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(VIEWPORT.0, VIEWPORT.1);
+    match pixels {
+        Some(pixels) => buffer.make_mut_bytes().copy_from_slice(&pixels),
+        None => buffer.make_mut_bytes().fill(255),
+    }
+    slint::Image::from_rgba8(buffer)
+}
+
 fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) {
     let items: Vec<TabItem> = manager
         .tabs()
@@ -77,12 +92,13 @@ fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) 
         .into(),
     );
 
+    window.set_page_image(render_page_image(manager, active_id));
+
     if let Some(id) = active_id {
         window.set_can_go_back(manager.can_go_back(id));
         window.set_can_go_forward(manager.can_go_forward(id));
         if let Some(tab) = manager.tab(id) {
             window.set_address_text(tab.url.clone().into());
-            window.set_page_text(format!("{}\n\n{} DOM nodes after layout.", tab.title, tab.node_count()).into());
         }
     }
 }
@@ -275,6 +291,19 @@ fn main() {
                 if let Some(target) = manager.borrow().peek_forward_url(id) {
                     start_load(id, net::NavIntent::Forward(target), &network, &manager, &window);
                 }
+            }
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        window.on_scroll(move |dx, dy| {
+            let window = window_weak.unwrap();
+            if let Some(id) = active_id.get() {
+                manager.borrow_mut().scroll_active(id, dx as f64, dy as f64);
+                window.set_page_image(render_page_image(&manager.borrow(), Some(id)));
             }
         });
     }

@@ -46,14 +46,24 @@ This is an early scaffold, not a daily driver yet. What works today:
   (MIT, actively developed), evaluated via a real dependency and test
   (`tests/gosub_html5_smoke.rs`) — its own from-scratch HTML5 parser
   verified working, though not wired into the tab pipeline yet.
+- **Real pages actually render, and scroll.** Fetched HTML is rasterized
+  (CPU-only, via `blitz-paint` + `anyrender_vello_cpu`, no GPU surface
+  needed) and shown in the content pane, with mouse-wheel scrolling wired
+  through to the layout engine and repainted live. Confirmed against a
+  real site (pypi.org, live-fetched over the network) running under Xvfb,
+  screenshotted before and after scrolling to its actual footer — not
+  just unit-tested. See ARCHITECTURE.md for a real bug this caught (a
+  missing base URL that crashed on any page with a relative link — i.e.
+  almost every real page) and how it was fixed.
 
 What's not wired up yet — see the roadmap in ARCHITECTURE.md:
 
-- Painting the laid-out page to pixels inside the content area (the pane
-  currently shows layout stats as text, not the rendered page, even though
-  it's now real fetched content being parsed and laid out).
 - Sub-resources: images, external stylesheets, and fonts referenced from a
-  page aren't fetched yet, only the top-level HTML document.
+  page aren't fetched yet, only the top-level HTML document — so real
+  pages currently render unstyled (real content, default browser styling).
+- Clicking a link doesn't navigate yet; only scrolling is interactive so far.
+- The rendered page doesn't re-layout on window resize (it scales the
+  existing bitmap instead).
 
 Platform target: Linux, Windows, and macOS, with no system rendering
 dependency on any of them. iOS is deliberately out of scope, not dropped
