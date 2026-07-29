@@ -1,0 +1,168 @@
+import { Button, LineEdit } from "std-widgets.slint";
+
+export struct TabItem {
+    id: int,
+    title: string,
+    url: string,
+    active: bool,
+    hibernated: bool,
+}
+
+component TabButton inherits Rectangle {
+    in property <TabItem> tab;
+    callback select();
+    callback close();
+
+    width: 180px;
+    height: 32px;
+    border-radius: 6px;
+    background: tab.active ? #3a3a3a : (touch.has-hover ? #2c2c2c : transparent);
+
+    touch := TouchArea {
+        clicked => { root.select(); }
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 4px;
+            spacing: 4px;
+
+            Text {
+                text: tab.hibernated ? "\u{1F4A4} " + tab.title : tab.title;
+                color: tab.hibernated ? #888888 : white;
+                font-size: 12px;
+                overflow: elide;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            closeArea := TouchArea {
+                width: 16px;
+                clicked => { root.close(); }
+                Text {
+                    text: "\u{2715}";
+                    color: closeArea.has-hover ? white : #999999;
+                    font-size: 10px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Melora";
+    preferred-width: 1000px;
+    preferred-height: 650px;
+    background: #1e1e1e;
+
+    in property <[TabItem]> tabs;
+    in property <string> address-text;
+    in property <string> status-text;
+    in property <string> page-text;
+    in property <bool> can-go-back;
+    in property <bool> can-go-forward;
+
+    callback new-tab();
+    callback close-tab(int);
+    callback activate-tab(int);
+    callback navigate(string);
+    callback go-back();
+    callback go-forward();
+    callback reload();
+
+    VerticalLayout {
+        // Tab strip
+        Rectangle {
+            height: 40px;
+            background: #262626;
+
+            HorizontalLayout {
+                padding: 4px;
+                spacing: 4px;
+
+                Flickable {
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 4px;
+                        for tab in root.tabs: TabButton {
+                            tab: tab;
+                            select => { root.activate-tab(tab.id); }
+                            close => { root.close-tab(tab.id); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: newTabArea.has-hover ? #3a3a3a : transparent;
+                    newTabArea := TouchArea {
+                        clicked => { root.new-tab(); }
+                        Text {
+                            text: "+";
+                            color: white;
+                            font-size: 18px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Navigation bar
+        Rectangle {
+            height: 44px;
+            background: #2d2d2d;
+
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 6px;
+
+                Button { text: "<"; enabled: root.can-go-back; clicked => { root.go-back(); } }
+                Button { text: ">"; enabled: root.can-go-forward; clicked => { root.go-forward(); } }
+                Button { text: "\u{27F3}"; clicked => { root.reload(); } }
+
+                addressBar := LineEdit {
+                    horizontal-stretch: 1;
+                    text: root.address-text;
+                    accepted(text) => { root.navigate(text); }
+                }
+
+                Button { text: "Go"; clicked => { root.navigate(addressBar.text); } }
+            }
+        }
+
+        // Content area (placeholder surface until page painting is wired to the engine)
+        Rectangle {
+            vertical-stretch: 1;
+            background: white;
+
+            Text {
+                text: root.page-text;
+                color: #111111;
+                font-size: 14px;
+                wrap: word-wrap;
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+            }
+        }
+
+        // Status bar
+        Rectangle {
+            height: 22px;
+            background: #262626;
+            Text {
+                text: root.status-text;
+                color: #aaaaaa;
+                font-size: 11px;
+                x: 8px;
+                vertical-alignment: center;
+                height: 100%;
+            }
+        }
+    }
+}
