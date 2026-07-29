@@ -41,7 +41,10 @@ impl NavIntent {
             NavIntent::Reload(_) => mgr.reload(id, html),
             NavIntent::Back(_) => mgr.go_back(id, html),
             NavIntent::Forward(_) => mgr.go_forward(id, html),
-            NavIntent::Wake(_) => mgr.activate(id, html),
+            // Only reached via TabManager::activate's NeedsRefetch fallback
+            // -- the common case wakes from the local compressed snapshot
+            // and never touches the network at all.
+            NavIntent::Wake(_) => mgr.force_activate(id, html),
         }
     }
 }

@@ -7,7 +7,21 @@ pub type TabId = u64;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TabState {
     Active,
-    Hibernated,
+    Compressed,
+}
+
+/// Outcome of trying to wake a tab. See [`TabManager::activate`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WakeResult {
+    /// Was already active; just marked most-recently-used.
+    AlreadyActive,
+    /// Was compressed; decompressed and re-parsed locally, no network
+    /// needed.
+    WokeFromCompressed,
+    /// No local snapshot exists (shouldn't happen for a tab that has ever
+    /// successfully loaded something) -- caller must fetch over the
+    /// network and apply it with `TabManager::force_activate`.
+    NeedsRefetch,
 }
 
 pub struct Tab {
@@ -18,11 +32,26 @@ pub struct Tab {
     history: Vec<String>,
     history_pos: usize,
     engine: Option<PageEngine>,
+    /// Raw bytes `engine` was built from. Kept alongside a live engine so
+    /// a later demotion can compress them without a network round-trip;
+    /// cleared once demoted (`compressed_html` becomes the sole
+    /// representation of the tab's content).
+    source_html: Option<Vec<u8>>,
+    /// LZ4-compressed HTML, present only while `state == Compressed`.
+    /// Decompressing and re-parsing this is the whole point of this
+    /// hibernation tier: waking a tab needs no network round-trip.
+    compressed_html: Option<Vec<u8>>,
 }
 
 impl Tab {
     pub fn node_count(&self) -> usize {
         self.engine.as_ref().map(PageEngine::node_count).unwrap_or(0)
+    }
+
+    /// Size in bytes of this tab's compressed snapshot; 0 while active (no
+    /// snapshot needed) or before anything has ever loaded.
+    pub fn compressed_bytes(&self) -> usize {
+        self.compressed_html.as_ref().map(Vec::len).unwrap_or(0)
     }
 }
 
@@ -30,9 +59,13 @@ impl Tab {
 /// resident in memory.
 ///
 /// Only the `max_active` most recently used tabs stay "warm" (a live parsed
-/// DOM + style + layout tree). The rest are hibernated down to a handful of
-/// strings (url, title, scroll position), so a session can hold hundreds of
-/// open tabs without hundreds of live engines in memory at once.
+/// DOM + style + layout tree). Every other tab is demoted to an
+/// LZ4-compressed copy of its source HTML in RAM -- a zram-style tier,
+/// not a discard-and-refetch one: waking a compressed tab decompresses
+/// and re-parses locally, with no network round-trip and no dependency on
+/// being online. This is what lets a session hold hundreds of open tabs
+/// without hundreds of live engines in memory, while still restoring each
+/// one instantly on demand.
 pub struct TabManager {
     tabs: Vec<Tab>,
     lru: VecDeque<TabId>, // front = least recently used, back = most recently used
@@ -64,6 +97,8 @@ impl TabManager {
             history: vec![url],
             history_pos: 0,
             engine: Some(PageEngine::from_html(html, self.viewport)),
+            source_html: Some(html.as_bytes().to_vec()),
+            compressed_html: None,
         });
         self.lru.push_back(id);
         self.enforce_budget();
@@ -76,12 +111,14 @@ impl TabManager {
     }
 
     /// Load `html` into `id` without touching browsing history. Used for
-    /// waking a hibernated tab, reloading, and back/forward navigation.
+    /// reload, back/forward, and the network-refetch fallback path.
     fn load(&mut self, id: TabId, url: &str, html: &str) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.url = url.to_string();
             tab.title = url.to_string();
             tab.engine = Some(PageEngine::from_html(html, self.viewport));
+            tab.source_html = Some(html.as_bytes().to_vec());
+            tab.compressed_html = None;
             tab.state = TabState::Active;
         }
         self.lru.retain(|&t| t != id);
@@ -89,19 +126,45 @@ impl TabManager {
         self.enforce_budget();
     }
 
-    /// Wake a hibernated tab (or no-op if already active) and mark it most
-    /// recently used, without changing its URL or history.
-    pub fn activate(&mut self, id: TabId, html_for_wake: &str) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
-            return;
+    /// Wakes a tab using its local compressed snapshot, with no network
+    /// involved -- see `WakeResult`. Also marks it most-recently-used.
+    pub fn activate(&mut self, id: TabId) -> WakeResult {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return WakeResult::NeedsRefetch;
         };
-        if tab.state == TabState::Hibernated {
-            let url = tab.url.clone();
-            self.load(id, &url, html_for_wake);
-        } else {
+
+        if tab.state == TabState::Active {
             self.lru.retain(|&t| t != id);
             self.lru.push_back(id);
+            return WakeResult::AlreadyActive;
         }
+
+        let Some(compressed) = tab.compressed_html.take() else {
+            return WakeResult::NeedsRefetch;
+        };
+        let Ok(bytes) = lz4_flex::decompress_size_prepended(&compressed) else {
+            return WakeResult::NeedsRefetch;
+        };
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        let engine = PageEngine::from_html(&html, self.viewport);
+
+        let tab = self.tabs.iter_mut().find(|t| t.id == id).unwrap();
+        tab.engine = Some(engine);
+        tab.source_html = Some(bytes);
+        tab.state = TabState::Active;
+
+        self.lru.retain(|&t| t != id);
+        self.lru.push_back(id);
+        self.enforce_budget();
+
+        WakeResult::WokeFromCompressed
+    }
+
+    /// Escape hatch for `WakeResult::NeedsRefetch`: force-loads freshly
+    /// fetched `html` and marks the tab active, without touching history.
+    pub fn force_activate(&mut self, id: TabId, html: &str) {
+        let url = self.tab(id).map(|t| t.url.clone()).unwrap_or_default();
+        self.load(id, &url, html);
     }
 
     /// User-initiated navigation: loads new content and pushes it onto the
@@ -177,21 +240,27 @@ impl TabManager {
         self.load(id, &url, html);
     }
 
+    /// Demotes the least-recently-used active tabs beyond `max_active` to
+    /// the compressed tier: their engine is dropped and their source HTML
+    /// is LZ4-compressed in its place.
     fn enforce_budget(&mut self) {
         let active_count = self.tabs.iter().filter(|t| t.state == TabState::Active).count();
         if active_count <= self.max_active {
             return;
         }
-        let mut to_hibernate = active_count - self.max_active;
+        let mut to_demote = active_count - self.max_active;
         for id in self.lru.iter() {
-            if to_hibernate == 0 {
+            if to_demote == 0 {
                 break;
             }
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == *id) {
                 if tab.state == TabState::Active {
+                    if let Some(bytes) = tab.source_html.take() {
+                        tab.compressed_html = Some(lz4_flex::compress_prepend_size(&bytes));
+                    }
                     tab.engine = None;
-                    tab.state = TabState::Hibernated;
-                    to_hibernate -= 1;
+                    tab.state = TabState::Compressed;
+                    to_demote -= 1;
                 }
             }
         }
@@ -209,8 +278,15 @@ impl TabManager {
         self.tabs.iter().filter(|t| t.state == TabState::Active).count()
     }
 
-    pub fn hibernated_count(&self) -> usize {
-        self.tabs.iter().filter(|t| t.state == TabState::Hibernated).count()
+    pub fn compressed_count(&self) -> usize {
+        self.tabs.iter().filter(|t| t.state == TabState::Compressed).count()
+    }
+
+    /// Total bytes currently held in compressed snapshots, across every
+    /// compressed tab. A concrete, computed measure of what the
+    /// "hundreds of tabs, very little RAM" claim actually costs.
+    pub fn total_compressed_bytes(&self) -> usize {
+        self.tabs.iter().map(Tab::compressed_bytes).sum()
     }
 }
 
@@ -220,32 +296,75 @@ mod tests {
 
     const DEMO: &str = "<html><body><p>demo</p></body></html>";
 
+    /// Real-ish page: long enough for LZ4 to have something to compress,
+    /// unlike the few-byte DEMO string used everywhere else in these tests.
+    fn repetitive_page(paragraphs: usize) -> String {
+        let mut html = String::from("<html><body>");
+        for i in 0..paragraphs {
+            html.push_str(&format!(
+                "<p>This is paragraph number {i} of a fairly ordinary web page, \
+                 with the kind of repeated boilerplate real HTML actually has.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        html
+    }
+
     #[test]
-    fn opening_tabs_beyond_budget_hibernates_the_oldest() {
+    fn opening_tabs_beyond_budget_compresses_the_oldest() {
         let mut mgr = TabManager::new(2, (800, 600));
         let a = mgr.open_tab("a", DEMO);
         let b = mgr.open_tab("b", DEMO);
         let c = mgr.open_tab("c", DEMO);
 
         assert_eq!(mgr.active_count(), 2);
-        assert_eq!(mgr.hibernated_count(), 1);
-        assert_eq!(mgr.tab(a).unwrap().state, TabState::Hibernated);
+        assert_eq!(mgr.compressed_count(), 1);
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Compressed);
         assert_eq!(mgr.tab(b).unwrap().state, TabState::Active);
         assert_eq!(mgr.tab(c).unwrap().state, TabState::Active);
     }
 
     #[test]
-    fn activating_a_hibernated_tab_wakes_it_and_hibernates_the_lru_tab() {
-        let mut mgr = TabManager::new(2, (800, 600));
-        let a = mgr.open_tab("a", DEMO);
-        let _b = mgr.open_tab("b", DEMO);
-        let _c = mgr.open_tab("c", DEMO); // hibernates a
+    fn demoting_a_tab_actually_compresses_its_content() {
+        let mut mgr = TabManager::new(1, (800, 600));
+        let page = repetitive_page(50);
+        let a = mgr.open_tab("a", &page);
+        mgr.open_tab("b", DEMO); // demotes a
 
-        mgr.activate(a, DEMO);
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Compressed);
+        let compressed_len = mgr.tab(a).unwrap().compressed_bytes();
+        assert!(compressed_len > 0, "expected a non-empty compressed snapshot");
+        assert!(
+            compressed_len < page.len(),
+            "expected real compression: {compressed_len} bytes compressed vs {} original",
+            page.len()
+        );
+    }
 
+    #[test]
+    fn waking_a_compressed_tab_needs_no_externally_supplied_html() {
+        let mut mgr = TabManager::new(1, (800, 600));
+        let page = repetitive_page(50);
+        let a = mgr.open_tab("a", &page);
+        let original_node_count = mgr.tab(a).unwrap().node_count();
+        mgr.open_tab("b", DEMO); // demotes a
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Compressed);
+
+        let result = mgr.activate(a);
+
+        assert_eq!(result, WakeResult::WokeFromCompressed);
         assert_eq!(mgr.tab(a).unwrap().state, TabState::Active);
-        assert_eq!(mgr.active_count(), 2);
-        assert_eq!(mgr.hibernated_count(), 1);
+        assert_eq!(mgr.tab(a).unwrap().node_count(), original_node_count);
+        // Waking demoted the LRU tab (b) in a's place, since the budget is 1.
+        assert_eq!(mgr.tab(mgr.tabs()[1].id).unwrap().state, TabState::Compressed);
+    }
+
+    #[test]
+    fn activating_an_already_active_tab_is_a_touch_not_a_reload() {
+        let mut mgr = TabManager::new(4, (800, 600));
+        let a = mgr.open_tab("a", DEMO);
+        assert_eq!(mgr.activate(a), WakeResult::AlreadyActive);
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Active);
     }
 
     #[test]
@@ -258,14 +377,26 @@ mod tests {
     }
 
     #[test]
-    fn hundreds_of_tabs_stay_within_the_active_budget() {
+    fn hundreds_of_tabs_stay_within_the_active_budget_and_compressed_total_stays_small() {
         let mut mgr = TabManager::new(8, (800, 600));
+        let page = repetitive_page(20);
         for i in 0..300 {
-            mgr.open_tab(format!("tab-{i}"), DEMO);
+            mgr.open_tab(format!("tab-{i}"), &page);
         }
         assert_eq!(mgr.tabs().len(), 300);
         assert_eq!(mgr.active_count(), 8);
-        assert_eq!(mgr.hibernated_count(), 292);
+        assert_eq!(mgr.compressed_count(), 292);
+
+        // 292 compressed tabs of a ~1.6KB page should total well under 1MB,
+        // not 292 live engines' worth of DOM/style/layout state.
+        let total = mgr.total_compressed_bytes();
+        assert!(total > 0);
+        assert!(
+            total < page.len() * 292,
+            "compressed total ({total} bytes) should be far less than storing \
+             292 uncompressed copies ({} bytes)",
+            page.len() * 292
+        );
     }
 
     #[test]

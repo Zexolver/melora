@@ -42,6 +42,16 @@ fn error_page_html(target: &str, message: &str) -> String {
     )
 }
 
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) {
     let items: Vec<TabItem> = manager
         .tabs()
@@ -51,17 +61,18 @@ fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) 
             title: t.title.clone().into(),
             url: t.url.clone().into(),
             active: Some(t.id) == active_id,
-            hibernated: t.state == TabState::Hibernated,
+            compressed: t.state == TabState::Compressed,
         })
         .collect();
     window.set_tabs(ModelRc::new(VecModel::from(items)));
 
     window.set_status_text(
         format!(
-            "{} tabs · {} active · {} hibernated",
+            "{} tabs · {} active · {} compressed ({})",
             manager.tabs().len(),
             manager.active_count(),
-            manager.hibernated_count(),
+            manager.compressed_count(),
+            format_bytes(manager.total_compressed_bytes()),
         )
         .into(),
     );
@@ -196,18 +207,17 @@ fn main() {
             let id = id as TabId;
             active_id.set(Some(id));
 
-            let needs_wake = manager
-                .borrow()
-                .tab(id)
-                .map(|t| t.state == TabState::Hibernated)
-                .unwrap_or(false);
-
-            if needs_wake {
-                let url = manager.borrow().tab(id).map(|t| t.url.clone()).unwrap_or_default();
-                start_load(id, net::NavIntent::Wake(url), &network, &manager, &window);
-            } else {
-                manager.borrow_mut().activate(id, "");
-                refresh(&window, &manager.borrow(), active_id.get());
+            // Tries the local compressed snapshot first -- no network
+            // involved in the common case. Only falls back to a real
+            // fetch if a tab somehow has no snapshot to wake from.
+            match manager.borrow_mut().activate(id) {
+                tabs::WakeResult::AlreadyActive | tabs::WakeResult::WokeFromCompressed => {
+                    refresh(&window, &manager.borrow(), active_id.get());
+                }
+                tabs::WakeResult::NeedsRefetch => {
+                    let url = manager.borrow().tab(id).map(|t| t.url.clone()).unwrap_or_default();
+                    start_load(id, net::NavIntent::Wake(url), &network, &manager, &window);
+                }
             }
         });
     }

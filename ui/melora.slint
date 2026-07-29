@@ -5,7 +5,7 @@ export struct TabItem {
     title: string,
     url: string,
     active: bool,
-    hibernated: bool,
+    compressed: bool,
 }
 
 component TabButton inherits Rectangle {
@@ -27,8 +27,8 @@ component TabButton inherits Rectangle {
             spacing: 4px;
 
             Text {
-                text: tab.hibernated ? "\u{1F4A4} " + tab.title : tab.title;
-                color: tab.hibernated ? #888888 : white;
+                text: tab.compressed ? "\u{1F5DC} " + tab.title : tab.title;
+                color: tab.compressed ? #888888 : white;
                 font-size: 12px;
                 overflow: elide;
                 vertical-alignment: center;

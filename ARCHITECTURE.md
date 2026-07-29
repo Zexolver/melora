@@ -73,20 +73,90 @@ vendoring genuinely dead, pre-1.0, non-library toy codebases wholesale.
 - **Tab model:** custom (`src/tabs.rs`) — this is Melora's own contribution,
   not sourced from any of the above.
 
-## Tab hibernation (the "hundreds of tabs, lightweight" feature)
+## Platform scope
+
+Melora targets desktop (Linux, Windows, macOS) with **no system
+dependency for rendering** — not a platform WebView, not WebKit, nothing.
+Every tab's engine is Melora's own code (Blitz today, gosub-engine under
+evaluation), the same on every desktop platform; the only thing that
+varies per OS is windowing, handled by Slint's existing cross-platform
+backend.
+
+Mobile is explicitly out of scope for now, not quietly dropped: iOS
+specifically cannot use a self-contained custom engine at all — Apple
+requires every iOS App Store browser to render through WebKit
+(`WKWebView`), full stop, which would mean either an actual system
+dependency there or not shipping on iOS. Since the point of this project
+is a genuinely self-contained engine, iOS is left out of the platform
+list rather than compromised on. Android doesn't have that restriction and
+could plausibly run the same Rust engine + Slint UI later, but that's real,
+separate cross-compilation work that hasn't been attempted yet.
+
+**UI toolkit:** Slint, chosen for its GPLv3 option (see License in
+README) and because it has, in practice, worked without issue through
+every milestone so far — it compiles, runs headlessly under Xvfb, and its
+callback/property model has cleanly supported everything built on top of
+it, including bridging a background network thread back to the UI thread
+safely (see Networking, below). [iced](https://iced.rs) (also
+GPL-compatible) is a reasonable fallback if Slint hits a real blocker —
+most plausibly during future mobile/Android work, where Slint's platform
+support would need to be re-evaluated — but switching now would mean
+discarding working, tested UI code to solve a problem that hasn't
+occurred. Noted here as the contingency, not something being built.
+
+## Tab compression (the "hundreds of tabs, low RAM" feature)
 
 `TabManager` keeps an LRU order over open tabs and a fixed budget
 (`max_active`, currently 8) of tabs allowed to hold a live `PageEngine` —
 the actual parsed DOM/style/layout tree, which is the expensive part of a
-browser tab. Every tab beyond the budget is hibernated: its `PageEngine` is
-dropped and only `url`, `title`, and browsing history are kept (a handful of
-short strings). Reactivating a hibernated tab reconstructs its engine.
+browser tab. This part is the same idea real browsers use (Chrome's tab
+discarding, Safari's tab suspension): most open tabs don't need to be fully
+resident at once.
 
-This is the same idea real browsers (Chrome's tab discarding, Safari's tab
-suspension) use for exactly this problem, implemented here as a small,
-independently testable component — see the `hundreds_of_tabs_stay_within_the_active_budget`
-test in `src/tabs.rs`, which opens 300 tabs and asserts only the budgeted
-few stay resident.
+Where Melora deliberately differs from "discard and refetch": every tab
+beyond the budget is demoted to an **LZ4-compressed copy of its source HTML
+kept in RAM** (`Tab::compressed_html`, `TabManager::enforce_budget` in
+`src/tabs.rs`), not dropped outright. Reactivating a tab decompresses and
+re-parses that snapshot locally — `TabManager::activate` — with **no
+network round-trip and no dependency on being online**, unlike a browser
+that literally discards a tab's state and has to re-fetch it from the
+internet when you switch back. This is the "zram for tabs" the design is
+named after: trade a little CPU (fast LZ4 compression) and a little RAM
+(the compressed snapshot, typically a small fraction of the original HTML,
+and tiny next to a live DOM/style/layout tree) for not needing the network
+at all to restore a tab.
+
+What this doesn't do: it isn't a byte-for-byte process-memory snapshot the
+way OS-level zram is. It compresses the *source* HTML and re-parses on
+wake, not a live execution/scroll/form-input state — because Melora
+doesn't have in-page interactivity wired up yet (see Roadmap). Once it
+does, extending the snapshot to include that state is the natural next
+step, not a redesign.
+
+Verified in `src/tabs.rs`'s tests:
+- `demoting_a_tab_actually_compresses_its_content` — asserts the
+  compressed snapshot is real (non-empty, smaller than the source), not
+  just a size-zero stub.
+- `waking_a_compressed_tab_needs_no_externally_supplied_html` — wakes a
+  tab and checks it's restored to the same DOM node count, calling
+  `activate` with no HTML argument at all, proving the network genuinely
+  isn't involved.
+- `hundreds_of_tabs_stay_within_the_active_budget_and_compressed_total_stays_small`
+  — opens 300 tabs and asserts both that only 8 stay active *and* that the
+  total compressed footprint across the other 292 is far smaller than
+  storing them uncompressed would be.
+
+The status bar surfaces this directly (`format_bytes` in `main.rs`): e.g.
+"300 tabs · 8 active · 292 compressed (14.2 KB)" — a computed number, not a
+claim.
+
+**On "more RAM-efficient than other browsers":** the compression tier is
+a real, measured improvement over Melora's own previous discard-based
+design, and a defensible one relative to how mainstream tab-discarding
+works in general. What isn't done, and shouldn't be claimed, is a
+head-to-head memory benchmark against Chrome/Firefox/Safari — that needs
+real profiling on real hardware outside this environment, not a number
+invented here.
 
 ## Networking
 
@@ -139,7 +209,7 @@ rather than regenerating a placeholder).
 3. Forward input events (mouse, scroll, keyboard) from the Slint content
    area into `blitz-dom`'s hit-testing/event handling, so pages become
    interactive.
-4. Persist hibernated-tab metadata to disk so a session with hundreds of
+4. Persist compressed-tab snapshots to disk so a session with hundreds of
    tabs survives a restart without re-fetching everything at once.
 5. Revisit memory/CPU budgets with real profiling data instead of the
    current fixed `max_active = 8` constant.
