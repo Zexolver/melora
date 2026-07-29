@@ -7,8 +7,11 @@ navigation). The goal is a daily-driver browser that stays light with
 hundreds of tabs open, by aggressively hibernating tabs you aren't looking
 at instead of keeping every tab's engine resident in memory.
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the research behind these
-choices and the current state of the project.
+The candidate projects come from
+[rusty-web-browsers-any](https://github.com/stars/Zexolver/lists/rusty-web-browsers-any),
+a curated list of dead/hobby/incomplete Rust browsers and engines. See
+[ARCHITECTURE.md](./ARCHITECTURE.md) for how each entry was evaluated, the
+research behind these choices, and the current state of the project.
 
 ## Status
 
@@ -25,6 +28,10 @@ This is an early scaffold, not a daily driver yet. What works today:
   including one that opens 300 tabs and checks only the budgeted few stay
   resident.
 - Per-tab back/forward history.
+- A second engine candidate, [gosub-engine](https://github.com/gosub-io/gosub-engine)
+  (MIT, actively developed), evaluated via a real dependency and test
+  (`tests/gosub_html5_smoke.rs`) — its own from-scratch HTML5 parser
+  verified working, though not wired into the tab pipeline yet.
 
 What's not wired up yet — see the roadmap in ARCHITECTURE.md:
 

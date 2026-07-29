@@ -12,3 +12,12 @@ blitz-traits = "0.1"
 
 [build-dependencies]
 slint-build = "1"
+
+# Evaluated as a second engine backend, per the rusty-web-browsers-any
+# survey in ARCHITECTURE.md. Not wired into the tab pipeline yet -- kept as
+# a dev-dependency exercised by tests/gosub_html5_smoke.rs.
+[dev-dependencies]
+gosub_css3 = { git = "https://github.com/gosub-io/gosub-engine" }
+gosub_html5 = { git = "https://github.com/gosub-io/gosub-engine" }
+gosub_interface = { git = "https://github.com/gosub-io/gosub-engine" }
+gosub_shared = { git = "https://github.com/gosub-io/gosub-engine" }

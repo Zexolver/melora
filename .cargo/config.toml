@@ -1,0 +1,7 @@
+# gosub-engine's crates declare `registry = "gosub"` on their internal
+# path dependencies (they publish to their own registry rather than
+# crates.io). Cargo needs this entry to parse those manifests even when
+# resolving the crates via the `git` dependencies below instead of that
+# registry.
+[registries]
+gosub = { index = "sparse+https://registry.gosub.io/" }
