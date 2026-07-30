@@ -145,9 +145,10 @@ impl TabManager {
         self.next_id += 1;
         let url = url.into();
         let engine = PageEngine::from_html(html, &url, self.viewport, self.resource_provider.clone());
+        let title = engine.title_override().map(str::to_string).unwrap_or_else(|| url.clone());
         self.tabs.push(Tab {
             id,
-            title: url.clone(),
+            title,
             url: url.clone(),
             state: TabState::Active,
             history: vec![url],
@@ -170,9 +171,10 @@ impl TabManager {
     /// reload, back/forward, and the network-refetch fallback path.
     fn load(&mut self, id: TabId, url: &str, html: &str) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            let engine = PageEngine::from_html(html, url, self.viewport, self.resource_provider.clone());
+            tab.title = engine.title_override().map(str::to_string).unwrap_or_else(|| url.to_string());
             tab.url = url.to_string();
-            tab.title = url.to_string();
-            tab.engine = Some(PageEngine::from_html(html, url, self.viewport, self.resource_provider.clone()));
+            tab.engine = Some(engine);
             tab.source_html = Some(html.as_bytes().to_vec());
             tab.compressed_html = None;
             tab.state = TabState::Active;
@@ -204,8 +206,10 @@ impl TabManager {
         };
         let html = String::from_utf8_lossy(&bytes).into_owned();
         let engine = PageEngine::from_html(&html, &url, self.viewport, self.resource_provider.clone());
+        let title = engine.title_override().map(str::to_string).unwrap_or(url);
 
         let tab = self.tabs.iter_mut().find(|t| t.id == id).unwrap();
+        tab.title = title;
         tab.engine = Some(engine);
         tab.source_html = Some(bytes);
         tab.state = TabState::Active;

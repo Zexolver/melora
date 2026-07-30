@@ -1,4 +1,5 @@
 mod engine;
+mod js;
 mod net;
 mod tabs;
 

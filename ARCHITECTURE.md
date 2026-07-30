@@ -333,16 +333,84 @@ loading works), and the panic is visible in the log (Rust's default panic
 hook still prints it -- useful for debugging -- `catch_unwind` only stops
 it from unwinding further) without taking the app down.
 
+## JavaScript
+
+Inline `<script>` tags now actually run, via [`boa_engine`](https://github.com/boa-dev/boa)
+(pure-Rust, no V8/system dependency -- picked specifically to keep the
+"no system dependency of any kind" property everywhere else in this repo;
+`gosub_v8`, the other JS path on the table, is a huge C++ build and was
+ruled out as infeasible in this environment, let alone as a good fit for
+a self-contained binary). `src/js.rs`'s `JsEngine` wraps one `boa_engine::Context`
+per page and binds a deliberately small set of host functions:
+
+- `console.log` / `console.warn` / `console.error` -- captured into a log
+  (`JsEngine::take_console`), not printed anywhere yet.
+- `document.title = "..."` -- a property *setter only* (`ObjectInitializer::accessor`
+  with no getter), captured into `JsEngine::title`.
+
+That's it. **This is not a DOM.** There's no `getElementById`, no element
+tree exposed to script, no event listeners, no `fetch`/`XMLHttpRequest`, no
+timers. A page that reads `document.title` back, queries the DOM, or relies
+on any other browser API will see `undefined`/throw, same as it would in
+an engine that never ran the script at all -- the difference this milestone
+makes is narrow and specific: simple scripts that log or set the page
+title (a surprisingly common real pattern -- SPA loading-state titles,
+analytics beacons that just log) now work, and it establishes the
+plumbing (a real embedded JS engine, wired into the page lifecycle) that
+a future, larger DOM-binding effort would build on rather than starting
+from zero.
+
+**Where scripts run:** `PageEngine::from_html` walks the parsed document
+(`collect_inline_scripts`, a stack-based pre-order DFS from the root,
+skipping any `<script src="...">` since external scripts aren't fetched)
+and runs every inline script it finds, in document order, against **one
+shared `JsEngine`** -- so `<script>var x = 1;</script>...<script>x++;</script>`
+sees the same global scope, matching how real browsers run multiple
+`<script>` blocks on one page. This happens exactly once, right after the
+initial layout resolve; scripts are *not* re-run when a sub-resource
+arrives later (`apply_resource`), since re-running on every stylesheet/
+image load would mean duplicate console spam and the title getting reset
+over and over for no reason.
+
+**Safety:** script execution is synchronous on the same call path as
+parsing, so a runaway script (`while (true) {}`) would otherwise hang the
+whole browser, not just its own tab. `JsEngine::new` sets
+`context.runtime_limits_mut().set_loop_iteration_limit(1_000_000)`, so a
+loop that never terminates errors out instead of hanging -- verified in
+`src/js.rs`'s `a_runaway_loop_is_bounded_instead_of_hanging` test. Thrown
+exceptions and syntax errors are likewise caught and logged rather than
+propagated (`a_thrown_exception_is_captured_not_propagated`) -- a broken
+script shouldn't take the page down any more than a missing image does.
+As defense in depth, `PageEngine::from_html` also wraps the whole
+collect-and-run step in `catch_unwind`, the same pattern already used for
+layout (see Crash containment) -- so even a panic inside `boa_engine`
+itself, or in the tree-walk, degrades to "no script output" rather than
+crashing the process.
+
+**Where it surfaces today:** a script's `document.title` override, once
+set, is threaded through to `Tab::title` (`TabManager::open_tab`, `load`,
+and the wake-from-compressed path in `activate` all now prefer
+`PageEngine::title_override()` over the raw URL when present) -- so the
+tab strip shows a script-set title, not just the address that was typed.
+`console.*` output is captured (`PageEngine::console_log`) but not shown
+in the UI yet; there's no devtools-style panel to put it in, so it's
+plumbed through and unused for now rather than left off entirely.
+
+The GC-safety mechanics (Boa's `Trace`/`Finalize` traits require captured
+closure state to implement `Trace`; a plain `Rc<RefCell<...>>` doesn't) are
+handled with a small newtype (`HostState` in `src/js.rs`) that opts out of
+GC tracing via `unsafe impl Trace { empty_trace!(); }` -- sound here
+specifically because the wrapped state is plain Rust strings, not JS/GC
+values, so there's nothing for the collector to need to trace into.
+
 ## What's still stubbed, and why
 
 - **Persisting compressed tabs across restarts.** A session's hundreds of
   compressed snapshots live in memory only; closing Melora loses them, so
   reopening means re-fetching everything. Roadmap item, not attempted yet.
-- **JavaScript.** Pages are static once loaded -- no script execution, so
-  anything client-side-rendered (PyPI's own trending-packages section,
-  for instance) won't appear. A large, separate undertaking (Blitz has no
-  JS engine; gosub-engine's `gosub_v8` is the more promising path here --
-  see the gosub-engine roadmap item below) rather than a small follow-up.
+- **JavaScript is real but narrow.** See the JavaScript section above --
+  `console`/`document.title` only, no DOM API, no events, no timers, no
+  network from script.
 
 ## Roadmap (rough order)
 
@@ -359,5 +427,8 @@ it from unwinding further) without taking the app down.
    replace Blitz as the primary engine, run as a selectable second engine,
    or stay as reference-only. Not decided yet; `tests/gosub_html5_smoke.rs`
    is the groundwork for making that call with real data instead of a
-   guess. Also the more likely path to JavaScript support, whenever that
-   becomes a priority.
+   guess.
+5. Grow the JS binding surface beyond `console`/`document.title` -- a real
+   `getElementById`/DOM-mutation API, once there's a design for keeping
+   `blitz-dom`'s tree and Boa's JS values in sync safely -- rather than
+   the deliberately narrow bindings in place now.

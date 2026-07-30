@@ -18,6 +18,13 @@ pub struct PageEngine {
     /// parse -- kept as an `Option` rather than unwrapped so a bad URL
     /// degrades to "links don't resolve" instead of a panic).
     base_url: Option<Url>,
+    /// `document.title` as set by an inline `<script>`, if any. `None`
+    /// means no script set it (the caller falls back to the URL).
+    js_title: Option<String>,
+    /// Everything logged via `console.*` by this page's inline scripts,
+    /// in order. Not surfaced in the UI yet -- kept for the day there's a
+    /// devtools-style panel to show it in.
+    console_log: Vec<String>,
 }
 
 impl PageEngine {
@@ -46,7 +53,28 @@ impl PageEngine {
         // pages (see the doc comment on `resolve_layout_safely`) -- caught
         // here rather than letting one bad page take the whole app down.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| document.resolve()));
-        Self { document, viewport, base_url: Url::parse(url).ok() }
+
+        // Run inline scripts once, after the initial layout, in document
+        // order against one shared JS context (so multiple <script> blocks
+        // see each other's globals, like a real browser). A script that
+        // panics the JS engine internally shouldn't take the page down any
+        // more than a bad stylesheet does, hence the same catch_unwind
+        // treatment as layout above.
+        let (js_title, console_log) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inline_scripts(&document)))
+                .unwrap_or_default();
+
+        Self { document, viewport, base_url: Url::parse(url).ok(), js_title, console_log }
+    }
+
+    /// `document.title` as last set by an inline script, if any.
+    pub fn title_override(&self) -> Option<&str> {
+        self.js_title.as_deref()
+    }
+
+    /// Everything this page's inline scripts logged via `console.*`.
+    pub fn console_log(&self) -> &[String] {
+        &self.console_log
     }
 
     pub fn node_count(&self) -> usize {
@@ -147,6 +175,40 @@ impl PageEngine {
         }
         None
     }
+}
+
+/// Depth-first, document-order walk collecting the text content of every
+/// inline `<script>` (i.e. one with no `src` -- external scripts aren't
+/// fetched, see ARCHITECTURE.md).
+fn collect_inline_scripts(document: &HtmlDocument) -> Vec<String> {
+    let mut scripts = Vec::new();
+    let mut stack = vec![document.root_node().id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = document.get_node(id) else { continue };
+        if node.data.is_element_with_tag_name(&local_name!("script")) && node.attr(local_name!("src")).is_none() {
+            scripts.push(node.text_content());
+        }
+        // Push in reverse so popping the stack visits children in the
+        // original left-to-right order.
+        stack.extend(node.children.iter().rev());
+    }
+    scripts
+}
+
+/// Runs every inline script found in `document` against one shared
+/// `JsEngine`, returning the final `document.title` override (if any
+/// script set one) and the combined console log. Skips constructing a JS
+/// engine at all for the common case of a script-less page.
+fn run_inline_scripts(document: &HtmlDocument) -> (Option<String>, Vec<String>) {
+    let scripts = collect_inline_scripts(document);
+    if scripts.is_empty() {
+        return (None, Vec::new());
+    }
+    let mut js = crate::js::JsEngine::new();
+    for script in &scripts {
+        js.run(script);
+    }
+    (js.title(), js.take_console())
 }
 
 #[cfg(test)]

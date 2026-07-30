@@ -69,6 +69,16 @@ This is an early scaffold, not a daily driver yet. What works today:
   an earlier crash this same live-testing approach caught (a missing base
   URL that broke on any page with a relative link, i.e. almost every real
   page).
+- **JavaScript actually runs**, via an embedded pure-Rust JS engine
+  ([`boa_engine`](https://github.com/boa-dev/boa) — no V8, no system
+  dependency). Inline `<script>` tags execute in document order against a
+  shared per-page context, with a deliberately small set of real host
+  bindings: `console.log/warn/error` and a `document.title` setter — not
+  a full DOM (no `getElementById`, no events, no timers). A runaway script
+  (`while (true) {}`) is bounded rather than hanging the browser. Verified
+  live: a page whose script sets `document.title = "Changed by JS"` shows
+  that title in the real tab strip, not just in a unit test. See
+  ARCHITECTURE.md for the exact scope and why it's drawn there.
 
 All of the above was checked against a real running instance under Xvfb
 (driven with `xdotool`, screenshotted with `xwd`), not just unit-tested —
@@ -76,7 +86,9 @@ see ARCHITECTURE.md for the specific before/after evidence on each one.
 
 What's not wired up yet — see the roadmap in ARCHITECTURE.md:
 
-- JavaScript doesn't run, so anything client-side-rendered won't appear.
+- JavaScript is real but narrow: `console`/`document.title` only, no DOM
+  API, so anything that needs real client-side rendering (beyond setting
+  the page title or logging) won't appear.
 - Compressed tabs live in memory only; they don't survive a restart.
 - The underlying `blitz-dom` table-layout bug above is contained, not
   fixed — affected pages stop laying out fully partway through rather
