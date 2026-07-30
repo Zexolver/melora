@@ -57,6 +57,15 @@ This is an early scaffold, not a daily driver yet. What works today:
   way (the OS close button, Alt+F4) gets the same guarantee, via a
   `on_close_requested` hook -- Hibernate is the discoverable, intentional
   version of something that's actually always true.
+- **Customizable look and feel.** A settings panel (gear icon in the nav
+  bar) offers Dark/Light themes for the browser chrome -- every themed
+  color lives in one Slint `global`, switching applies live with no
+  restart, and the choice persists across restarts. Only the chrome is
+  themed; pages render as authored, same as any real browser's dark
+  mode. Live-testing this caught and fixed a real layout bug (both the
+  settings panel and the restore prompt were silently stretching to the
+  full window height instead of sizing to their content); see
+  ARCHITECTURE.md.
 - Per-tab back/forward history.
 - Real HTTP(S) fetching (`src/net.rs`, via `blitz-net`): typing an address,
   reload, back/forward, and (as a fallback only -- waking normally comes

@@ -273,6 +273,74 @@ background tab -- and seeing it wake correctly (swapped count
 decrementing, the real page content appearing) with the process still
 alive afterward.
 
+## Hibernate
+
+A nav-bar button, deliberately not called "Quit": clicking it flushes
+`persist_session` one more time (belt-and-suspenders -- see Session
+persistence above, which already saves continuously) and then closes the
+window. Closing the window any other way -- the OS close button,
+Alt+F4, a session logout -- gets the identical guarantee via
+`Window::on_close_requested` (`main.rs`), which runs the same save
+before returning `CloseRequestResponse::HideWindow` to let the close
+proceed. There's deliberately no separate "just quit and lose nothing"
+path and "quit and lose everything" path; Hibernate names the one
+behavior that already exists, rather than adding a second one.
+
+Verified live: opened 2 tabs, clicked Hibernate, confirmed the process
+actually exited (not just hid the window) and `session.bin` reflected
+both tabs, relaunched, and got the real restore prompt reporting "2
+tab(s)".
+
+## UI theming and settings
+
+The chrome's colors are not hardcoded in `melora.slint` -- every themed
+surface reads from an `export global Theme` singleton (`bg`, `chrome`,
+`chrome-alt`, `surface-hover`, `border`, `text`, `text-muted`, `accent`),
+which `main.rs`'s `apply_theme` sets from one of two hand-picked
+palettes (`settings::Theme::Dark` / `Light`). This is deliberately a
+*global*, not a per-component prop threaded everywhere -- Slint globals
+are exactly the mechanism for "one value, read by many components,
+written from Rust," which is precisely this shape. Only the browser
+*chrome* is themed; the content pane always paints the page as authored
+(`background: white` there is fixed), the same distinction a real
+browser's dark mode makes.
+
+A gear-icon button opens a small settings panel (a conditional overlay,
+same pattern as the restore prompt) with Dark/Light buttons -- the
+selected one gets a visible accent-colored border via a plain
+`root.current-theme == "..."` comparison, no extra state needed since
+`current-theme` is just the string `main.rs` already sets from the
+active `Theme` enum. Picking one calls `apply_theme` immediately (so the
+whole UI updates live, no restart) and persists the choice via
+`settings::SettingsStore` (`src/settings.rs`) -- the same tiny
+length-prefixed-binary-plus-magic-number pattern as `session.rs`, factored
+apart because a corrupt/missing settings file and a corrupt/missing
+session file should fail independently (one shouldn't be able to take
+the other down). Both now share `src/paths.rs`'s `data_dir()` rather than
+each defining their own copy of the same platform-detection logic.
+
+**A real layout bug this caught, live:** the first version of both the
+settings panel and the restore-prompt dialog set only `width` on their
+outer `Rectangle`, not `height`. Slint's default sizing for a plain
+element with no explicit geometry inside a non-layout parent is to fill
+that parent -- so both dialogs silently stretched to the full window
+height instead of sizing to their content, with the last row (a lone
+`Button` in a `HorizontalLayout { alignment: end; }`) absorbing all the
+leftover space and rendering as one enormous button. This wasn't caught
+by anything except actually looking at a live screenshot -- there's no
+unit-testable notion of "does this look right" for a UI layout. Fixed by
+giving both dialogs an explicit `height` and centering them explicitly
+(`x`/`y` computed from the parent's size), rather than relying on
+default positioning, which had them pinned to the top-left corner even
+before this bug -- also only visible by looking.
+
+Verified live: opened the settings panel (properly sized and centered
+this time), switched to Light, confirmed every themed surface in the
+chrome actually changed color while the content pane stayed white,
+restarted the process, and confirmed the Light choice was still active
+with no settings interaction at all -- proving persistence, not just the
+in-session toggle.
+
 ## Networking
 
 `src/net.rs` wires up real HTTP(S) fetching via `blitz-net`, replacing the

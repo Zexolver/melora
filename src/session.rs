@@ -31,7 +31,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new() -> Self {
-        Self { path: data_dir().join("session.bin") }
+        Self { path: crate::paths::data_dir().join("session.bin") }
     }
 
     #[cfg(test)]
@@ -95,33 +95,6 @@ impl SessionStore {
             Err(e) => Err(e),
         }
     }
-}
-
-/// Resolves a real per-user data directory across platforms without
-/// pulling in a directories crate: `$XDG_DATA_HOME` or `~/.local/share`
-/// on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on
-/// Windows, falling back to the system temp dir if none of those
-/// environment variables are set (e.g. a minimal/sandboxed environment).
-fn data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("melora");
-        }
-    }
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        if !appdata.is_empty() {
-            return PathBuf::from(appdata).join("melora");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            if cfg!(target_os = "macos") {
-                return PathBuf::from(home).join("Library/Application Support/melora");
-            }
-            return PathBuf::from(home).join(".local/share/melora");
-        }
-    }
-    std::env::temp_dir().join("melora")
 }
 
 fn write_u32(buf: &mut Vec<u8>, v: u32) {

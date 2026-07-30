@@ -1,7 +1,9 @@
 mod engine;
 mod js;
 mod net;
+mod paths;
 mod session;
+mod settings;
 mod swap;
 mod tabs;
 
@@ -53,6 +55,39 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Pushes `theme`'s palette into the `Theme` global every themed element
+/// in `melora.slint` reads from, and updates `current-theme` (the string
+/// the settings panel compares against to highlight the active choice).
+/// Only the browser chrome changes -- the content pane always paints
+/// whatever the page itself specifies, same as a real browser's dark
+/// mode doesn't repaint the websites you visit.
+fn apply_theme(window: &MainWindow, theme: settings::Theme) {
+    let t = Theme::get(window);
+    match theme {
+        settings::Theme::Dark => {
+            t.set_bg(slint::Color::from_rgb_u8(0x1e, 0x1e, 0x1e));
+            t.set_chrome(slint::Color::from_rgb_u8(0x26, 0x26, 0x26));
+            t.set_chrome_alt(slint::Color::from_rgb_u8(0x2d, 0x2d, 0x2d));
+            t.set_surface_hover(slint::Color::from_rgb_u8(0x3a, 0x3a, 0x3a));
+            t.set_border(slint::Color::from_rgb_u8(0x3f, 0x3f, 0x3f));
+            t.set_text(slint::Color::from_rgb_u8(0xf2, 0xf2, 0xf2));
+            t.set_text_muted(slint::Color::from_rgb_u8(0x9a, 0x9a, 0x9a));
+            t.set_accent(slint::Color::from_rgb_u8(0x5b, 0x8d, 0xee));
+        }
+        settings::Theme::Light => {
+            t.set_bg(slint::Color::from_rgb_u8(0xf5, 0xf5, 0xf5));
+            t.set_chrome(slint::Color::from_rgb_u8(0xe8, 0xe8, 0xe8));
+            t.set_chrome_alt(slint::Color::from_rgb_u8(0xee, 0xee, 0xee));
+            t.set_surface_hover(slint::Color::from_rgb_u8(0xd8, 0xd8, 0xd8));
+            t.set_border(slint::Color::from_rgb_u8(0xcc, 0xcc, 0xcc));
+            t.set_text(slint::Color::from_rgb_u8(0x1a, 0x1a, 0x1a));
+            t.set_text_muted(slint::Color::from_rgb_u8(0x66, 0x66, 0x66));
+            t.set_accent(slint::Color::from_rgb_u8(0x33, 0x66, 0xcc));
+        }
+    }
+    window.set_current_theme(theme.as_str().into());
 }
 
 /// Rasterizes the active tab's page and wraps it as a Slint image. Falls
@@ -163,6 +198,9 @@ fn main() {
     let (network, net_events) = net::Network::spawn();
     let network = Rc::new(network);
     manager.borrow_mut().set_resource_provider(network.resource_provider());
+
+    let settings_store = Rc::new(settings::SettingsStore::new());
+    apply_theme(&window, settings_store.load().theme);
 
     let session_store = Rc::new(session::SessionStore::new());
     // A prior run's tabs, if any, held here until the user answers the
@@ -344,6 +382,31 @@ fn main() {
         window.window().on_close_requested(move || {
             persist_session(&session_store, &manager, active_id.get());
             slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        window.on_open_settings(move || {
+            window_weak.unwrap().set_show_settings(true);
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        window.on_close_settings(move || {
+            window_weak.unwrap().set_show_settings(false);
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let settings_store = settings_store.clone();
+        window.on_set_theme(move |name| {
+            let window = window_weak.unwrap();
+            let theme = if name == "light" { settings::Theme::Light } else { settings::Theme::Dark };
+            apply_theme(&window, theme);
+            let _ = settings_store.save(&settings::Settings { theme });
         });
     }
 
