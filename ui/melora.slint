@@ -77,6 +77,7 @@ export component MainWindow inherits Window {
     callback viewport-resized(width: length, height: length);
     callback restore-session();
     callback discard-session();
+    callback hibernate();
 
     VerticalLayout {
         // Tab strip
@@ -139,6 +140,16 @@ export component MainWindow inherits Window {
                 }
 
                 Button { text: "Go"; clicked => { root.navigate(addressBar.text); } }
+
+                // Saves every open tab (via whichever hibernation tier it's
+                // already in -- RAM-compressed or disk-swapped, see
+                // ARCHITECTURE.md) and closes the window. Named Hibernate
+                // rather than Quit: closing this way (or any other way --
+                // the OS window-close button behaves the same, see
+                // main.rs's `on_close_requested` hook) is what lets the
+                // next launch restore every tab from its local snapshot,
+                // no network refetch involved.
+                Button { text: "Hibernate"; clicked => { root.hibernate(); } }
             }
         }
 

@@ -308,6 +308,45 @@ fn main() {
         });
     }
 
+    // Hibernate: an explicit, discoverable "close and preserve everything"
+    // action -- deliberately not called "Quit", since nothing is discarded.
+    // Every tab is already continuously persisted (see `persist_session`
+    // call sites throughout this function), so this final save is a
+    // belt-and-suspenders flush for the case where the very last thing
+    // that happened was opening the window with nothing else done yet;
+    // the save itself reads each tab from whichever tier it's actually
+    // in -- RAM-compressed or disk-swapped -- so restoring it next launch
+    // never touches the network. See `on_close_requested` below for why
+    // the OS window-close button gets the same guarantee without needing
+    // this button specifically.
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        let session_store = session_store.clone();
+        window.on_hibernate(move || {
+            let window = window_weak.unwrap();
+            persist_session(&session_store, &manager, active_id.get());
+            let _ = window.window().hide();
+        });
+    }
+
+    // Closing the window any other way (the OS/window-manager close
+    // button, Alt+F4, a session logout) should preserve tabs exactly like
+    // clicking Hibernate does -- there's no reason "the deliberate button"
+    // and "however else the user happens to close it" should behave
+    // differently. `HideWindow` (the default response) lets the close
+    // proceed as normal after the save.
+    {
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        let session_store = session_store.clone();
+        window.window().on_close_requested(move || {
+            persist_session(&session_store, &manager, active_id.get());
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
     {
         let window_weak = window.as_weak();
         let manager = manager.clone();

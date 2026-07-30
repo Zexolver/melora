@@ -1,0 +1,77 @@
+name: Release
+
+# Fires on version tags (v0.1.0, v0.2.0-alpha, ...), not on every push --
+# building all three platforms is too slow/costly to run on every commit.
+# Tag once something's worth handing to someone to actually try.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: melora
+            asset_name: melora-linux-x86_64
+          - os: windows-latest
+            artifact_name: melora.exe
+            asset_name: melora-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: melora
+            asset_name: melora-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only Linux needs this: blitz-net's native-tls dependency uses
+      # OpenSSL there specifically, schannel on Windows and
+      # Security.framework on macOS, both already present on those
+      # runners with no extra package.
+      - name: Install native dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libfontconfig1-dev pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.artifact_name }}" "dist/${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

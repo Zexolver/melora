@@ -518,6 +518,44 @@ GC tracing via `unsafe impl Trace { empty_trace!(); }` -- sound here
 specifically because the wrapped state is plain Rust strings, not JS/GC
 values, so there's nothing for the collector to need to trace into.
 
+## Does Melora load ads?
+
+Asked directly, worth answering directly: **mostly no, but not because
+anything blocks them -- because the engine is currently too limited to
+run what actually delivers them.** Worth being precise about why, since
+"no ads" for the wrong reason is a fragile property, not a feature:
+
+- **Static `<img>`-tag ads would load.** `blitz-dom` fetches every
+  sub-resource a page's HTML actually references (see Sub-resource
+  loading above) with no filtering of any kind -- an ad image linked
+  directly in the server-rendered markup loads exactly like any other
+  image.
+- **JS-injected ads mostly can't, because two different limitations both
+  have to be true at once for that to matter, and both currently are.**
+  Modern ad delivery is almost entirely JavaScript: a network's script
+  tag runs, then creates the actual ad markup (an `<iframe>`, an `<img>`,
+  more `<script>` tags) at runtime. Melora currently blocks this whole
+  path twice over: *external* `<script src="...">` tags aren't fetched
+  or run at all (see JavaScript above -- only inline scripts execute),
+  and even an inline script that ran the same logic couldn't act on it,
+  since the JS bindings don't expose any DOM-mutation API (`document`
+  only has a `title` setter -- no `createElement`, no `appendChild`, no
+  `innerHTML`). So the dominant real-world ad-delivery mechanism is
+  unreachable from two independent directions right now.
+- **`<iframe>` isn't implemented at all** (not by Blitz, not by anything
+  in `src/engine.rs`), which rules out the other extremely common ad
+  format (an iframe pointing at an ad network's own page) regardless of
+  script execution.
+
+None of this was designed as ad-blocking -- it's what "JavaScript
+support" narrowly scoped to `console`/`document.title` and no `<iframe>`
+support happens to imply as a side effect. It'll stop being true the
+moment the JS binding surface grows a real DOM API (roadmap below), at
+which point ads will load exactly as well as any other JS-driven content
+does, same as a real browser, unless something is deliberately built to
+prevent it -- see the network-layer blocklist and WASM extension items
+below, which is where actual, intentional ad-blocking would have to live.
+
 ## What's still stubbed, and why
 
 - **JavaScript is real but narrow.** See the JavaScript section above --
@@ -526,6 +564,8 @@ values, so there's nothing for the collector to need to trace into.
 - **The disk swap tier never reclaims space within a run.** See the disk
   swap tier section above -- append-only by design, deleted whole on
   exit; a real free-list is future work if it ever matters in practice.
+- **No extension system of any kind.** No content-blocking, no
+  WebExtensions compatibility, nothing. See Roadmap.
 
 ## Roadmap (rough order)
 
@@ -548,3 +588,19 @@ values, so there's nothing for the collector to need to trace into.
 5. Give the disk swap tier a real free list, if profiling ever shows the
    append-only growth within a single long-running session actually
    matters.
+6. A network-layer domain/URL blocklist (à la uBlock Origin's network
+   filtering, minus the extension machinery) -- checked in `src/net.rs`
+   before a request is ever issued. This is real, intentional ad/tracker
+   blocking, and it's a much smaller project than an extension system:
+   no JS DOM API, no sandboxing model, no extension format needed, just
+   a list and a lookup. Worth doing before, or independent of, item 7.
+7. A WASM-based extension system, so something like uBlock Origin's
+   *actual logic* (not the WebExtensions-format package itself, which
+   assumes a Chromium/Firefox host) could run inside Melora -- a
+   sandboxed WASM runtime (`wasmtime`/`wasmi`, both Rust, keeping the
+   no-system-dependency property) with a deliberately-designed extension
+   API surface (request interception at minimum for blocking; a content-
+   script-style DOM API would need item 4 first). Substantial, open-
+   ended work -- content-blocking specifically is much better served by
+   item 6 first; this is for the day extensions in general (not just
+   blocking) are wanted.

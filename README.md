@@ -49,6 +49,14 @@ This is an early scaffold, not a daily driver yet. What works today:
   the right count, restored, and got all 45 back with the same one
   active -- which also caught and fixed a real `RefCell` double-borrow
   crash on waking a restored background tab; see ARCHITECTURE.md.
+- **Hibernate.** A nav-bar button that closes the window after an
+  explicit final save -- named that instead of "Quit" because nothing is
+  discarded: every tab, whichever tier it's in, gets read back and
+  written to the session file, so the next launch restores it from the
+  local snapshot with no network refetch. Closing the window any other
+  way (the OS close button, Alt+F4) gets the same guarantee, via a
+  `on_close_requested` hook -- Hibernate is the discoverable, intentional
+  version of something that's actually always true.
 - Per-tab back/forward history.
 - Real HTTP(S) fetching (`src/net.rs`, via `blitz-net`): typing an address,
   reload, back/forward, and (as a fallback only -- waking normally comes
@@ -123,6 +131,15 @@ cargo run
 
 Requires a Rust toolchain with the 2024 edition (`rustc` ≥ 1.85) and, on
 Linux, the usual windowing libraries (X11/Wayland + `libxkbcommon`).
+
+## CI and downloadable builds
+
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs `cargo
+build`/`cargo test` on every push and pull request.
+[`.github/workflows/release.yml`](./.github/workflows/release.yml)
+builds release binaries for Linux, Windows, and macOS and attaches them
+to a GitHub Release whenever a `v*` tag is pushed -- that's how to get an
+actual binary to try without building from source yourself.
 
 ## License
 
