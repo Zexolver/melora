@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
+use blitz_dom::net::Resource;
 use blitz_net::Provider;
-use blitz_traits::net::{Request, SharedCallback, Url};
+use blitz_traits::net::{NetProvider, Request, SharedCallback, Url};
 
 use crate::tabs::{TabId, TabManager};
 
@@ -49,39 +50,71 @@ impl NavIntent {
     }
 }
 
+/// The two event streams a `Network` produces, both meant to be drained on
+/// the UI thread (see `main.rs`'s `slint::Timer`).
+pub struct NetworkEvents {
+    /// Completed top-level page fetches (navigate/reload/back/forward/wake).
+    pub pages: Receiver<(TabId, NavIntent, FetchOutcome)>,
+    /// Completed sub-resource fetches (stylesheets, images, fonts),
+    /// triggered internally by blitz-dom as it parses a page -- tagged with
+    /// the document id they belong to, since by the time one arrives the
+    /// tab may have navigated away, closed, or been demoted (see
+    /// `TabManager::apply_resource`).
+    pub resources: Receiver<(usize, Resource)>,
+}
+
 /// Bridges Blitz's async networking (`blitz-net`, which needs a tokio
 /// runtime) to Slint's single-threaded UI event loop (which doesn't).
 ///
 /// A dedicated OS thread owns a tokio runtime and does the actual fetching.
-/// Only `Send`-safe data (ids, URLs, bytes, `NavIntent`) crosses the thread
-/// boundary -- nothing here ever touches `TabManager` or any Slint type
-/// directly from the background thread, since neither is `Send`. The
-/// receiving end is meant to be drained on the UI thread via a
-/// `slint::Timer` (see `main.rs`), where applying `NavIntent` to the
-/// `TabManager` is safe.
+/// Only `Send`-safe data (ids, URLs, bytes, `NavIntent`, `Resource`) crosses
+/// the thread boundary -- nothing here ever touches `TabManager` or any
+/// Slint type directly from the background thread, since neither is
+/// `Send`. The receiving ends (`NetworkEvents`) are meant to be drained on
+/// the UI thread, where applying them to the `TabManager` is safe.
 pub struct Network {
     tx: tokio::sync::mpsc::UnboundedSender<(TabId, Url, NavIntent)>,
+    resource_provider: Arc<dyn NetProvider<Resource>>,
 }
 
 impl Network {
-    pub fn spawn() -> (Self, Receiver<(TabId, NavIntent, FetchOutcome)>) {
+    pub fn spawn() -> (Self, NetworkEvents) {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to start network runtime");
+
+        // Provider::new() looks up the "current" tokio runtime via a
+        // thread-local, so it must run inside an active `enter()` guard.
+        // The resulting Handle is captured by value, so the providers stay
+        // valid after the guard is dropped -- only construction needs it.
+        let _guard = runtime.enter();
+
+        let page_provider = Arc::new(Provider::<()>::new(Arc::new(|_id: usize, _res: Result<(), Option<String>>| {})));
+
+        let (resource_tx, resource_rx) = channel::<(usize, Resource)>();
+        let resource_callback: SharedCallback<Resource> = Arc::new(move |doc_id, result| {
+            // A failed sub-resource fetch (missing image, 404'd stylesheet)
+            // just means that one resource never shows up -- not a reason
+            // to do anything else, the page renders without it.
+            if let Ok(resource) = result {
+                let _ = resource_tx.send((doc_id, resource));
+            }
+        });
+        let resource_provider: Arc<dyn NetProvider<Resource>> =
+            Arc::new(Provider::<Resource>::new(resource_callback));
+
+        drop(_guard);
+
         let (fetch_tx, mut fetch_rx) =
             tokio::sync::mpsc::unbounded_channel::<(TabId, Url, NavIntent)>();
-        let (result_tx, result_rx) = channel::<(TabId, NavIntent, FetchOutcome)>();
+        let (page_result_tx, page_result_rx) = channel::<(TabId, NavIntent, FetchOutcome)>();
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("failed to start network runtime");
-            rt.block_on(async move {
-                let noop: SharedCallback<()> =
-                    Arc::new(|_id: usize, _res: Result<(), Option<String>>| {});
-                let provider = Arc::new(Provider::<()>::new(noop));
-
+            runtime.block_on(async move {
                 while let Some((id, url, intent)) = fetch_rx.recv().await {
-                    let provider = provider.clone();
-                    let result_tx = result_tx.clone();
+                    let page_provider = page_provider.clone();
+                    let page_result_tx = page_result_tx.clone();
                     tokio::spawn(async move {
                         let request = Request::get(url);
-                        let outcome = match provider.fetch_async(request).await {
+                        let outcome = match page_provider.fetch_async(request).await {
                             Ok((_final_url, bytes)) => FetchOutcome::Ok {
                                 bytes: bytes.to_vec(),
                             },
@@ -89,17 +122,27 @@ impl Network {
                                 message: format!("{e:?}"),
                             },
                         };
-                        let _ = result_tx.send((id, intent, outcome));
+                        let _ = page_result_tx.send((id, intent, outcome));
                     });
                 }
             });
         });
 
-        (Network { tx: fetch_tx }, result_rx)
+        (
+            Network { tx: fetch_tx, resource_provider },
+            NetworkEvents { pages: page_result_rx, resources: resource_rx },
+        )
     }
 
     pub fn fetch(&self, id: TabId, url: Url, intent: NavIntent) {
         let _ = self.tx.send((id, url, intent));
+    }
+
+    /// Shared across every tab's document, so each one can fetch its own
+    /// sub-resources (stylesheets, images, fonts) as it parses. See
+    /// `TabManager::set_resource_provider`.
+    pub fn resource_provider(&self) -> Arc<dyn NetProvider<Resource>> {
+        self.resource_provider.clone()
     }
 }
 
@@ -132,13 +175,14 @@ mod tests {
         let path = write_tempfile_html("<html><body><h1>from disk</h1></body></html>");
         let url = Url::from_file_path(&path).unwrap();
 
-        let (network, results) = Network::spawn();
+        let (network, events) = Network::spawn();
         let mut mgr = TabManager::new(8, (800, 600));
         let id = mgr.open_tab("melora://start", "<html></html>");
 
         network.fetch(id, url.clone(), NavIntent::Navigate(url.to_string()));
 
-        let (got_id, intent, outcome) = results
+        let (got_id, intent, outcome) = events
+            .pages
             .recv_timeout(Duration::from_secs(10))
             .expect("fetch did not complete in time");
         assert_eq!(got_id, id);
@@ -152,6 +196,53 @@ mod tests {
         intent.apply(&mut mgr, id, &html);
         assert_eq!(mgr.tab(id).unwrap().url, url.to_string());
         assert!(mgr.tab(id).unwrap().node_count() > 0);
+    }
+
+    /// Exercises the sub-resource half of `Network` end to end: a page
+    /// whose stylesheet is fetched via the shared `resource_provider`
+    /// actually gets styled once the resulting `Resource` is drained and
+    /// applied -- the same path a real page's CSS/images/fonts go through.
+    /// Uses `file://` URLs so the test is hermetic.
+    #[test]
+    fn resource_provider_delivers_a_fetched_stylesheet_to_the_right_doc() {
+        let dir = std::env::temp_dir().join(format!(
+            "melora-net-subres-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("style.css"))
+            .unwrap()
+            .write_all(b"#box { background-color: rgb(9,9,9); }")
+            .unwrap();
+        let html = "<html><head><link rel=\"stylesheet\" href=\"style.css\"></head>\
+                     <body style=\"margin:0;\"><div id=\"box\" style=\"width:20px;height:20px;\">\
+                     </div></body></html>";
+        let html_path = dir.join("page.html");
+        std::fs::File::create(&html_path).unwrap().write_all(html.as_bytes()).unwrap();
+        let url = Url::from_file_path(&html_path).unwrap();
+
+        let (network, events) = Network::spawn();
+        let mut mgr = TabManager::new(8, (20, 20));
+        mgr.set_resource_provider(network.resource_provider());
+        let id = mgr.open_tab(url.to_string(), html);
+
+        let before = mgr.tab(id).unwrap().paint().unwrap();
+        assert_ne!(&before[..4], &[9, 9, 9, 255], "sanity check: shouldn't be pre-styled");
+
+        let (doc_id, resource) = events
+            .resources
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no resource event received");
+        assert!(mgr.apply_resource(doc_id, resource));
+
+        let after = mgr.tab(id).unwrap().paint().unwrap();
+        assert_eq!(&after[..4], &[9, 9, 9, 255], "external stylesheet was not applied");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write_tempfile_html(html: &str) -> std::path::PathBuf {

@@ -223,46 +223,141 @@ to its real footer. `PageEngine::from_html` now takes the page's URL and
 threads it into `config.base_url`; `resolves_relative_hrefs_against_the_page_url_instead_of_panicking`
 in `src/engine.rs` is the regression test.
 
+## Sub-resource loading (stylesheets, images, fonts)
+
+Pages now fetch their own stylesheets, images, and fonts, not just the
+top-level HTML -- this is what turns a real page from readable-but-plain
+text into something that actually looks like the site. `blitz-dom`
+dispatches these fetches itself as it parses (whenever it hits a
+`<link rel=stylesheet>`, `<img src>`, `@font-face`, etc.) through whatever
+`NetProvider<Resource>` is set on the document; `Network::spawn`
+(`src/net.rs`) constructs exactly one such provider (a
+`blitz_net::Provider<Resource>`, the same generic networking backend used
+for top-level page fetches) and shares it across every tab via
+`TabManager::set_resource_provider`. Results come back on the same
+background thread as page fetches, through a second channel
+(`NetworkEvents::resources`), and are applied the same way: drained on the
+UI thread by `main.rs`'s existing timer, routed to the right tab by
+matching `Resource`'s tagged doc id against each tab's `PageEngine::doc_id`
+(`TabManager::apply_resource`), then `PageEngine::apply_resource` calls
+`BaseDocument::load_resource` and re-resolves style + layout.
+
+Proven two ways: a hermetic test (`resource_provider_delivers_a_fetched_stylesheet_to_the_right_doc`
+in `src/net.rs`, plus an equivalent in `src/engine.rs`) that fetches a
+`file://` stylesheet and checks the resulting pixels actually changed, and
+live -- see Crash containment below, which walks through the real
+before/after screenshots against pypi.org: unstyled black-text-on-white
+before this milestone, real blue banners, the actual PyPI logo image, and
+correct typography after it.
+
+## Click-to-navigate
+
+`PageEngine::hit_test_href` (`src/engine.rs`) hit-tests a point via
+`BaseDocument::hit`, then walks up the hit node's ancestors
+(`Node::parent`) looking for the nearest enclosing `<a href>` (the actual
+hit target is usually the text or an inline element *inside* the link, not
+the `<a>` itself), and resolves that `href` against the page's base URL.
+`melora.slint`'s content-area `TouchArea` reports `clicked` with its
+`mouse-x`/`mouse-y`, scaled in `main.rs` from the `TouchArea`'s actual
+on-screen size to `PageEngine`'s raster size (they can differ, e.g. before
+a resize settles) before hit-testing.
+
+Verified two ways: unit tests in `src/engine.rs`
+(`hit_test_href_resolves_a_relative_link_against_the_page_url`,
+and a "clicking empty space finds nothing" negative case), and live --
+a controlled `file://` test page (a full-viewport link to a second page)
+loaded in the real running app, clicked via `xdotool`, screenshotted
+before (a red block reading "CLICK ME TO NAVIGATE") and after (green,
+"NAVIGATION SUCCEEDED") to confirm the whole chain -- hit-test, href
+resolution, and the resulting `NavIntent::Navigate` -- actually fires from
+a real pointer click, not just at the Rust-API level.
+
+## Resize-driven re-layout
+
+The content pane's `Rectangle` in `melora.slint` has `changed width` /
+`changed height` handlers that fire `viewport-resized`; `main.rs` calls
+`TabManager::resize_viewport`, which updates every currently-active tab's
+`PageEngine` (`BaseDocument::set_viewport` + re-resolve) and remembers the
+new size for tabs created or woken afterward. This replaces the earlier
+"stretch the existing bitmap" behavior (`image-fit: fill` still exists in
+the `.slint`, but now mostly just interpolates the sub-pixel gap between a
+resize event landing and the next repaint, rather than doing all the work)
+with a real re-layout at the new size.
+
+Whether Slint fires `changed` callbacks reliably for built-in geometry
+properties (as opposed to explicitly-declared ones, the only case its own
+test suite covers) wasn't documented, so it was checked directly: a
+minimal window with `changed width/height` on a `Rectangle`, run under
+Xvfb, resized via `xdotool windowsize`, confirmed the callback fired with
+the post-resize dimensions before this was built into the real app.
+Confirmed again live in the full app afterward: a link's text visibly
+rewrapped from two lines to one after narrowing the window, which only
+happens with a genuine re-layout, not a stretched bitmap.
+
+## Crash containment: a real bug in the underlying engine
+
+Wiring up sub-resource loading surfaced a real, reproducible crash in
+`blitz-dom` 0.1.4 itself: once pypi.org's real stylesheet was fetched and
+applied, re-resolving layout panicked --
+`index out of bounds: the len is 2 but the index is 2` inside
+`blitz_dom::layout::table::TableTreeWrapper`'s grid-child-style lookup
+(`layout/table.rs:333`), i.e. a bug in how that engine version emulates
+HTML `<table>` layout via CSS Grid, most likely triggered by an irregular
+table (rows with different cell counts) somewhere on the real page. This
+is a bug in the third-party engine, not something patchable from here
+without vendoring and modifying `blitz-dom`'s source -- out of scope for
+this project. Several minimal repros were tried (jagged rows, colspan
+mismatches, an empty row, `display: grid` overrides) and none reproduced
+it in isolation; only the real page's actual CSS does. That's consistent
+with immature layout code in a genuinely young (0.1.x) engine, which is a
+real, honest cost of the "assemble from young/incomplete Rust engine
+projects" premise this whole repo is built on -- not swept under the rug.
+
+What matters for a daily driver is that one page's rendering bug can't
+take the whole browser down. `PageEngine` now wraps every call into
+`blitz-dom`'s layout resolution (`from_html`, `apply_resource`, `resize`)
+and into painting (`paint`) in `std::panic::catch_unwind`
+(`resolve_layout_safely` in `src/engine.rs`), converting a would-be crash
+into "this operation didn't fully succeed" (`false`/`None`) instead of an
+unwind that reaches `main`. The page may end up showing stale or
+incomplete layout when this happens, but the process keeps running and
+the rest of the browser -- other tabs, the chrome, further navigation --
+is unaffected.
+
+Verified live, not just reasoned about: the exact same steps that crashed
+the process before the fix (navigate to `https://pypi.org/` in the real
+running app under Xvfb) were re-run after it. Screenshots confirm all of
+it together: the process stayed alive (checked via `ps`), the page shows
+real styling and a real rendered PyPI logo image (proving sub-resource
+loading works), and the panic is visible in the log (Rust's default panic
+hook still prints it -- useful for debugging -- `catch_unwind` only stops
+it from unwinding further) without taking the app down.
+
 ## What's still stubbed, and why
 
-- **Sub-resources.** Only the top-level HTML document is fetched. Images,
-  external stylesheets, and fonts referenced from that HTML aren't loaded
-  yet -- which is why a live-rendered page currently looks unstyled (real
-  content, browser/user-agent-default styling only). Fixing this needs
-  wiring `blitz-dom`'s resource-loading dispatch (the `doc_id`/`NetHandler`
-  machinery `blitz-net`'s `NetProvider::fetch` trait method is actually
-  designed for, which the networking milestone deliberately sidestepped by
-  using the simpler `fetch_async` for just the top-level document). This is
-  the single biggest remaining gap between "renders real content" and
-  "looks like the real site."
-- **No interactivity beyond scroll.** Clicking a link doesn't navigate.
-  `blitz_dom::BaseDocument::hit(x, y)` (hit-testing) and `Node::attr` (to
-  read `href` off the hit element or its ancestors) are both available and
-  unused so far -- the natural next step, not a redesign.
-- **Fixed viewport, not responsive.** `PageEngine` renders at a constant
-  size (`VIEWPORT` in `main.rs`); the Slint `Image` stretches
-  (`image-fit: fill`) to whatever the content pane's actual on-screen size
-  is, which means resizing the window scales the bitmap instead of
-  re-laying-out the page at the new size. Correct, but not how a real
-  browser feels when resized.
+- **Persisting compressed tabs across restarts.** A session's hundreds of
+  compressed snapshots live in memory only; closing Melora loses them, so
+  reopening means re-fetching everything. Roadmap item, not attempted yet.
+- **JavaScript.** Pages are static once loaded -- no script execution, so
+  anything client-side-rendered (PyPI's own trending-packages section,
+  for instance) won't appear. A large, separate undertaking (Blitz has no
+  JS engine; gosub-engine's `gosub_v8` is the more promising path here --
+  see the gosub-engine roadmap item below) rather than a small follow-up.
 
 ## Roadmap (rough order)
 
-1. Wire sub-resource loading (images, external CSS, fonts) through
-   `blitz-dom`'s resource dispatch -- this is what makes rendered pages
-   look like the real site instead of unstyled content.
-2. Click-to-navigate: hit-test on click, walk up to the nearest `<a href>`,
-   resolve it against the page's base URL, and navigate.
-3. Re-layout (not just re-rasterize) on window resize, matching
-   `PageEngine`'s viewport to the content pane's actual size.
-4. Persist compressed-tab snapshots to disk so a session with hundreds of
+1. Report or work around the `blitz-dom` table-layout panic upstream, so
+   affected pages (like pypi.org) render fully instead of stopping partway
+   through layout once it's hit (contained now, not yet fixed).
+2. Persist compressed-tab snapshots to disk so a session with hundreds of
    tabs survives a restart without re-fetching everything at once.
-5. Revisit memory/CPU budgets with real profiling data instead of the
+3. Revisit memory/CPU budgets with real profiling data instead of the
    current fixed `max_active = 8` constant.
-6. Decide gosub-engine's role: it has its own layout/render pipeline
+4. Decide gosub-engine's role: it has its own layout/render pipeline
    (`gosub_render_pipeline`, `gosub_renderer_vello`) and even a JS engine
    binding (`gosub_v8`) that Blitz doesn't — evaluate whether it should
    replace Blitz as the primary engine, run as a selectable second engine,
    or stay as reference-only. Not decided yet; `tests/gosub_html5_smoke.rs`
    is the groundwork for making that call with real data instead of a
-   guess.
+   guess. Also the more likely path to JavaScript support, whenever that
+   becomes a priority.

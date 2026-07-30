@@ -57,9 +57,10 @@ fn format_bytes(bytes: usize) -> String {
 /// normally happen) it has no live engine, rather than showing stale
 /// pixels from whatever was painted last.
 fn render_page_image(manager: &TabManager, active_id: Option<TabId>) -> slint::Image {
+    let (width, height) = manager.viewport();
     let pixels = active_id.and_then(|id| manager.tab(id)).and_then(|tab| tab.paint());
 
-    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(VIEWPORT.0, VIEWPORT.1);
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
     match pixels {
         Some(pixels) => buffer.make_mut_bytes().copy_from_slice(&pixels),
         None => buffer.make_mut_bytes().fill(255),
@@ -142,8 +143,9 @@ fn main() {
     let window = MainWindow::new().unwrap();
     let manager = Rc::new(RefCell::new(TabManager::new(MAX_ACTIVE_TABS, VIEWPORT)));
     let active_id = Rc::new(Cell::new(None::<TabId>));
-    let (network, net_results) = net::Network::spawn();
+    let (network, net_events) = net::Network::spawn();
     let network = Rc::new(network);
+    manager.borrow_mut().set_resource_provider(network.resource_provider());
 
     {
         let mut mgr = manager.borrow_mut();
@@ -152,9 +154,10 @@ fn main() {
     }
     refresh(&window, &manager.borrow(), active_id.get());
 
-    // Drains completed network fetches on the UI thread and applies them --
-    // the background network thread never touches TabManager or Slint
-    // directly, since neither is `Send`. See net.rs.
+    // Drains completed network fetches and sub-resource loads on the UI
+    // thread and applies them -- the background network thread never
+    // touches TabManager or Slint directly, since neither is `Send`. See
+    // net.rs.
     let timer = slint::Timer::default();
     {
         let window_weak = window.as_weak();
@@ -168,7 +171,7 @@ fn main() {
                     return;
                 };
                 let mut applied = false;
-                while let Ok((id, intent, outcome)) = net_results.try_recv() {
+                while let Ok((id, intent, outcome)) = net_events.pages.try_recv() {
                     let mut mgr = manager.borrow_mut();
                     let html = match outcome {
                         net::FetchOutcome::Ok { bytes } => String::from_utf8_lossy(&bytes).into_owned(),
@@ -176,6 +179,11 @@ fn main() {
                     };
                     intent.apply(&mut mgr, id, &html);
                     applied = true;
+                }
+                while let Ok((doc_id, resource)) = net_events.resources.try_recv() {
+                    if manager.borrow_mut().apply_resource(doc_id, resource) {
+                        applied = true;
+                    }
                 }
                 if applied {
                     refresh(&window, &manager.borrow(), active_id.get());
@@ -305,6 +313,50 @@ fn main() {
                 manager.borrow_mut().scroll_active(id, dx as f64, dy as f64);
                 window.set_page_image(render_page_image(&manager.borrow(), Some(id)));
             }
+        });
+    }
+
+    // Click-to-navigate: hit-test at the click position (scaled from the
+    // TouchArea's actual on-screen size to the page's raster size, since
+    // `image-fit: fill` can stretch them apart) and, if it landed on a
+    // link, navigate to it.
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        let network = network.clone();
+        window.on_click(move |x, y, area_width, area_height| {
+            let window = window_weak.unwrap();
+            let Some(id) = active_id.get() else { return };
+
+            let (raster_width, raster_height) = manager.borrow().viewport();
+            let scale_x = if area_width > 0.0 { raster_width as f32 / area_width } else { 1.0 };
+            let scale_y = if area_height > 0.0 { raster_height as f32 / area_height } else { 1.0 };
+
+            let href = manager.borrow().tab(id).and_then(|t| t.hit_test_href(x * scale_x, y * scale_y));
+            if let Some(href) = href {
+                start_load(id, net::NavIntent::Navigate(href), &network, &manager, &window);
+            }
+        });
+    }
+
+    // Re-lays-out the active tab (and every other currently-active one) for
+    // the content pane's actual on-screen size whenever it changes -- see
+    // the `changed width/height` handlers on the content Rectangle in
+    // melora.slint.
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        window.on_viewport_resized(move |width, height| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let width = width.max(1.0) as u32;
+            let height = height.max(1.0) as u32;
+            if manager.borrow().viewport() == (width, height) {
+                return;
+            }
+            manager.borrow_mut().resize_viewport(width, height);
+            refresh(&window, &manager.borrow(), active_id.get());
         });
     }
 

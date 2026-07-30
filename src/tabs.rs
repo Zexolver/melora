@@ -1,4 +1,8 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+use blitz_dom::net::Resource;
+use blitz_traits::net::NetProvider;
 
 use crate::engine::PageEngine;
 
@@ -55,10 +59,11 @@ impl Tab {
     }
 
     /// Rasterized RGBA8 pixels of the page as currently scrolled, or
-    /// `None` if this tab has no live engine (compressed, or never
-    /// loaded).
+    /// `None` if this tab has no live engine (compressed, or never loaded)
+    /// or painting hit a contained internal panic (see
+    /// `PageEngine::paint`).
     pub fn paint(&self) -> Option<Vec<u8>> {
-        self.engine.as_ref().map(PageEngine::paint)
+        self.engine.as_ref().and_then(PageEngine::paint)
     }
 
     /// Scrolls the page; a no-op if this tab has no live engine.
@@ -66,6 +71,27 @@ impl Tab {
         if let Some(engine) = self.engine.as_mut() {
             engine.scroll_by(dx, dy);
         }
+    }
+
+    /// This tab's document id, used to route an incoming `Resource` to the
+    /// right tab. `None` if there's no live engine.
+    pub fn doc_id(&self) -> Option<usize> {
+        self.engine.as_ref().map(PageEngine::doc_id)
+    }
+
+    /// Applies a fetched sub-resource; a no-op if this tab has no live
+    /// engine (e.g. it was demoted between the fetch starting and
+    /// finishing).
+    pub fn apply_resource(&mut self, resource: Resource) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.apply_resource(resource);
+        }
+    }
+
+    /// If `(x, y)` lands on a link, the URL it resolves to. `None` if
+    /// there's no live engine or nothing was hit.
+    pub fn hit_test_href(&self, x: f32, y: f32) -> Option<String> {
+        self.engine.as_ref()?.hit_test_href(x, y)
     }
 }
 
@@ -86,6 +112,12 @@ pub struct TabManager {
     next_id: TabId,
     max_active: usize,
     viewport: (u32, u32),
+    /// Lets every tab's document fetch its own sub-resources (stylesheets,
+    /// images, fonts). `None` (the default -- see `new`) means pages parse
+    /// fine but render with only inline/UA styles; set once via
+    /// `set_resource_provider` in the real app. Left unset in tests, which
+    /// use self-contained HTML with no sub-resources to fetch.
+    resource_provider: Option<Arc<dyn NetProvider<Resource>>>,
 }
 
 impl TabManager {
@@ -96,14 +128,23 @@ impl TabManager {
             next_id: 0,
             max_active,
             viewport,
+            resource_provider: None,
         }
+    }
+
+    pub fn set_resource_provider(&mut self, provider: Arc<dyn NetProvider<Resource>>) {
+        self.resource_provider = Some(provider);
+    }
+
+    pub fn viewport(&self) -> (u32, u32) {
+        self.viewport
     }
 
     pub fn open_tab(&mut self, url: impl Into<String>, html: &str) -> TabId {
         let id = self.next_id;
         self.next_id += 1;
         let url = url.into();
-        let engine = PageEngine::from_html(html, &url, self.viewport);
+        let engine = PageEngine::from_html(html, &url, self.viewport, self.resource_provider.clone());
         self.tabs.push(Tab {
             id,
             title: url.clone(),
@@ -131,7 +172,7 @@ impl TabManager {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.url = url.to_string();
             tab.title = url.to_string();
-            tab.engine = Some(PageEngine::from_html(html, url, self.viewport));
+            tab.engine = Some(PageEngine::from_html(html, url, self.viewport, self.resource_provider.clone()));
             tab.source_html = Some(html.as_bytes().to_vec());
             tab.compressed_html = None;
             tab.state = TabState::Active;
@@ -162,7 +203,7 @@ impl TabManager {
             return WakeResult::NeedsRefetch;
         };
         let html = String::from_utf8_lossy(&bytes).into_owned();
-        let engine = PageEngine::from_html(&html, &url, self.viewport);
+        let engine = PageEngine::from_html(&html, &url, self.viewport, self.resource_provider.clone());
 
         let tab = self.tabs.iter_mut().find(|t| t.id == id).unwrap();
         tab.engine = Some(engine);
@@ -262,6 +303,30 @@ impl TabManager {
         tab.history_pos += 1;
         let url = tab.history[tab.history_pos].clone();
         self.load(id, &url, html);
+    }
+
+    /// Routes a fetched sub-resource to whichever tab's document it
+    /// belongs to (matched by doc id, since resources arrive asynchronously
+    /// and the tab may since have navigated away, been closed, or been
+    /// demoted). Returns `true` if a live tab was found and updated.
+    pub fn apply_resource(&mut self, doc_id: usize, resource: Resource) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.doc_id() == Some(doc_id)) else {
+            return false;
+        };
+        tab.apply_resource(resource);
+        true
+    }
+
+    /// Re-lays-out every currently-active tab for a new viewport size
+    /// (e.g. the content pane was resized) and remembers it for tabs
+    /// created or woken afterward.
+    pub fn resize_viewport(&mut self, width: u32, height: u32) {
+        self.viewport = (width, height);
+        for tab in self.tabs.iter_mut() {
+            if let Some(engine) = tab.engine.as_mut() {
+                engine.resize(width, height);
+            }
+        }
     }
 
     /// Demotes the least-recently-used active tabs beyond `max_active` to
@@ -471,5 +536,31 @@ mod tests {
 
         assert!(!mgr.can_go_forward(a));
         assert_eq!(mgr.tab(a).unwrap().url, "z");
+    }
+
+    #[test]
+    fn resizing_the_viewport_relayouts_active_tabs_and_is_remembered_for_new_ones() {
+        let mut mgr = TabManager::new(4, (800, 600));
+        let a = mgr.open_tab("a", DEMO);
+        assert_eq!(mgr.tab(a).unwrap().paint().unwrap().len(), 800 * 600 * 4);
+
+        mgr.resize_viewport(400, 300);
+
+        assert_eq!(mgr.tab(a).unwrap().paint().unwrap().len(), 400 * 300 * 4);
+        assert_eq!(mgr.viewport(), (400, 300));
+
+        // A tab opened after the resize should use the new size too.
+        let b = mgr.open_tab("b", DEMO);
+        assert_eq!(mgr.tab(b).unwrap().paint().unwrap().len(), 400 * 300 * 4);
+    }
+
+    #[test]
+    fn apply_resource_routes_to_the_matching_tab_by_doc_id_and_ignores_stale_ids() {
+        let mut mgr = TabManager::new(4, (800, 600));
+        let a = mgr.open_tab("a", DEMO);
+        let doc_id = mgr.tab(a).unwrap().doc_id().unwrap();
+
+        assert!(!mgr.apply_resource(doc_id + 12345, Resource::None));
+        assert!(mgr.apply_resource(doc_id, Resource::None));
     }
 }
