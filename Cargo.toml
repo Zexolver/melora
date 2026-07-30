@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 
+# Built as a library (used by both the desktop binary below and Android's
+# `android_main` entry point in src/lib.rs) as well as a `cdylib` -- the
+# shared-object form Android's Java/Kotlin activity shim loads via JNI.
+# `cdylib` alone can't be linked by our own `src/main.rs` bin target, so
+# both are listed; the extra `cdylib` output on desktop builds is unused
+# but harmless.
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "melora"
+path = "src/main.rs"
+
 [dependencies]
 slint = "1"
 blitz-dom = "0.1"
@@ -18,6 +31,23 @@ anyrender_vello_cpu = "0.6"
 boa_engine = "0.20"
 boa_gc = "0.20"
 
+# Slint's Android integration is its own backend, selected via this
+# feature (see src/lib.rs's `android_main` and
+# https://docs.rs/slint/latest/slint/android/index.html) rather than the
+# desktop winit backend `slint = "1"` above pulls in by default.
+[target.'cfg(target_os = "android")'.dependencies]
+slint = { version = "1", features = ["backend-android-activity-06"] }
+# blitz-net's `reqwest` dependency uses reqwest's "default-tls" (i.e.
+# native-tls -> openssl-sys) feature unconditionally -- blitz-net doesn't
+# expose a rustls option to opt out of it. There's no system OpenSSL to
+# link against for Android, so `vendored` builds one from source at
+# compile time using the NDK's own C toolchain instead (verified: without
+# this, `openssl-sys`'s build script fails outright on this target with
+# "Could not find directory of OpenSSL installation"). Desktop builds
+# don't pay this cost -- system OpenSSL via pkg-config is fast and
+# already relied on there.
+openssl = { version = "0.10", features = ["vendored"] }
+
 [build-dependencies]
 slint-build = "1"
 
@@ -29,3 +59,15 @@ gosub_css3 = { git = "https://github.com/gosub-io/gosub-engine" }
 gosub_html5 = { git = "https://github.com/gosub-io/gosub-engine" }
 gosub_interface = { git = "https://github.com/gosub-io/gosub-engine" }
 gosub_shared = { git = "https://github.com/gosub-io/gosub-engine" }
+
+# Read by `cargo apk` (https://github.com/rust-mobile/cargo-apk) to build
+# and sign an APK from the `cdylib` target above -- see
+# .github/workflows/release.yml and ARCHITECTURE.md's Android section.
+[package.metadata.android]
+package = "org.melora.browser"
+apk_label = "Melora"
+target_sdk_version = 34
+min_sdk_version = 26
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"

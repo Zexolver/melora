@@ -82,27 +82,105 @@ evaluation), the same on every desktop platform; the only thing that
 varies per OS is windowing, handled by Slint's existing cross-platform
 backend.
 
-Mobile is explicitly out of scope for now, not quietly dropped: iOS
-specifically cannot use a self-contained custom engine at all — Apple
-requires every iOS App Store browser to render through WebKit
-(`WKWebView`), full stop, which would mean either an actual system
-dependency there or not shipping on iOS. Since the point of this project
-is a genuinely self-contained engine, iOS is left out of the platform
-list rather than compromised on. Android doesn't have that restriction and
-could plausibly run the same Rust engine + Slint UI later, but that's real,
-separate cross-compilation work that hasn't been attempted yet.
+iOS is explicitly out of scope, not quietly dropped: Apple requires
+every iOS App Store browser to render through WebKit (`WKWebView`), full
+stop, which would mean either an actual system dependency there or not
+shipping on iOS. Since the point of this project is a genuinely self-
+contained engine, iOS is left out of the platform list rather than
+compromised on.
+
+**Android is now a real, verified target** — see the Android section
+below.
 
 **UI toolkit:** Slint, chosen for its GPLv3 option (see License in
 README) and because it has, in practice, worked without issue through
 every milestone so far — it compiles, runs headlessly under Xvfb, and its
 callback/property model has cleanly supported everything built on top of
 it, including bridging a background network thread back to the UI thread
-safely (see Networking, below). [iced](https://iced.rs) (also
-GPL-compatible) is a reasonable fallback if Slint hits a real blocker —
-most plausibly during future mobile/Android work, where Slint's platform
-support would need to be re-evaluated — but switching now would mean
-discarding working, tested UI code to solve a problem that hasn't
-occurred. Noted here as the contingency, not something being built.
+safely (see Networking, below), and, as of the Android section below,
+cross-compiling to a real mobile target with no code changes to the UI
+itself. [iced](https://iced.rs) (also GPL-compatible) is noted here as a
+contingency if Slint ever hits a real blocker, but there's been no reason
+to reach for it.
+
+## Android
+
+Melora builds for Android (`aarch64-linux-android`) as of this milestone
+-- verified end to end in this environment: a real signed `.apk`
+(`target/debug/apk/melora.apk`, ~550 MB debug-unstripped) was built from
+this exact codebase, from a clean checkout, using nothing but `rustup`,
+the Android NDK, the Android SDK's command-line tools, and
+[`cargo-apk`](https://github.com/rust-mobile/cargo-apk). Not claimed on
+faith -- built, inspected (`file` confirms a valid APK with a manifest),
+and the underlying Rust code both `cargo check`s and links cleanly for
+the target.
+
+**What changed to make this possible:**
+
+- **The crate became a library plus two thin entry points.** All of the
+  app's logic (previously `fn main()` in `src/main.rs`) moved to `pub fn
+  run()` in `src/lib.rs`, which both entry points call: the desktop
+  `src/main.rs` (now just `fn main() { melora::run(); }`) and a new
+  `android_main` function in `src/lib.rs`, gated on `#[cfg(target_os =
+  "android")]`, which Android's Java/Kotlin activity shim loads from the
+  crate's `cdylib` build (`[lib] crate-type = ["lib", "cdylib"]` in
+  Cargo.toml -- `cdylib` for Android's JNI loading, `lib` so the desktop
+  binary can still link against its own package normally). Slint's own
+  documented Android integration
+  (`slint::android::init`, see [its module docs](https://docs.rs/slint/latest/slint/android/))
+  is what dictates this shape -- it isn't a Melora-specific choice.
+- **Slint's Android backend is a separate, target-gated dependency:**
+  `[target.'cfg(target_os = "android")'.dependencies] slint = { features
+  = ["backend-android-activity-06"] }`, additive to the base `slint = "1"`
+  dependency (Cargo unions features across dependency edges for the
+  matching target) rather than replacing it -- desktop keeps its default
+  winit backend untouched.
+- **A real, non-obvious blocker: `native-tls` has no OpenSSL to link
+  against on Android.** blitz-net depends on plain `reqwest = "0.12"`
+  with no way to opt out of reqwest's `default-tls` feature (native-tls,
+  which uses OpenSSL via `openssl-sys` on Android same as on Linux) --
+  confirmed by trying: `cargo check --target aarch64-linux-android`
+  failed outright with "Could not find directory of OpenSSL
+  installation" before this was addressed. Fixed by adding `openssl =
+  { version = "0.10", features = ["vendored"] }` as an Android-only
+  dependency, which builds OpenSSL from source at compile time using the
+  NDK's own C toolchain instead of searching for a system install that
+  doesn't exist on Android. Desktop builds don't pay this cost -- system
+  OpenSSL via pkg-config there is fast and unaffected.
+- **A real, documented upstream bug: JDK 21 breaks Android's dexer on
+  build-tools 34.** `i-slint-backend-android-activity`'s build script
+  shells out to `d8` to compile a small Java input-handling shim, and
+  with the JDK this environment (and GitHub's `ubuntu-latest` runners)
+  actually has installed, that step threw a `NullPointerException` and
+  aborted the build -- a known issue
+  ([slint-ui/slint#4973](https://github.com/slint-ui/slint/issues/4973)),
+  not something introduced here. The build script's own error message
+  names both fixes (downgrade to JDK 17, or use build-tools 35); this
+  project pins `ANDROID_BUILD_TOOLS_VERSION=35.0.0` as the less invasive
+  one.
+
+**What building actually produces today:** a **debug-signed** APK --
+`cargo apk build` (no `--release`) auto-generates and signs with a debug
+keystore, which is exactly what's needed to sideload onto a device for
+testing but not something to publish to the Play Store. A `--release`
+build was also verified to fully compile and link (5m50s, optimized,
+zero errors) but `cargo apk` then refuses to package it without a
+`[package.metadata.android.signing.release]` keystore configured --
+correctly so, Android requires every APK to be signed and cargo-apk
+won't silently reuse the debug key for a release build. Wiring up real
+release signing (generating a keystore, storing it as a CI secret) is
+future work for whenever actual distribution, not just testing, is the
+goal -- see Roadmap.
+
+**Known gap:** the INTERNET permission is declared
+(`[[package.metadata.android.uses_permission]] name =
+"android.permission.INTERNET"` in Cargo.toml, read by cargo-apk when
+generating the manifest), so networking should work on-device the same
+as desktop, but this hasn't been verified on an actual device or
+emulator in this environment -- only that it builds, links, and packages
+correctly. There's no Android emulator here to boot and click through;
+that verification is next, on a real device or emulator, not simulated
+here.
 
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 

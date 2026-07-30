@@ -1,8 +1,8 @@
 name: Release
 
 # Fires on version tags (v0.1.0, v0.2.0-alpha, ...), not on every push --
-# building all three platforms is too slow/costly to run on every commit.
-# Tag once something's worth handing to someone to actually try.
+# the Android build in particular is too slow/costly to run on every
+# commit. Tag once something's worth handing to someone to actually try.
 on:
   push:
     tags: ["v*"]
@@ -11,30 +11,15 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact_name: melora
-            asset_name: melora-linux-x86_64
-          - os: windows-latest
-            artifact_name: melora.exe
-            asset_name: melora-windows-x86_64.exe
-          - os: macos-latest
-            artifact_name: melora
-            asset_name: melora-macos-arm64
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Only Linux needs this: blitz-net's native-tls dependency uses
-      # OpenSSL there specifically, schannel on Windows and
-      # Security.framework on macOS, both already present on those
-      # runners with no extra package.
-      - name: Install native dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      # blitz-net's native-tls dependency uses OpenSSL on Linux
+      # specifically (schannel on Windows, Security.framework on macOS,
+      # if either of those targets is ever added back to this matrix).
+      - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -45,24 +30,91 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.os }}
+          key: release-linux-x86_64
 
       - name: Build release binary
         run: cargo build --release --verbose
 
       - name: Package
-        shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.artifact_name }}" "dist/${{ matrix.asset_name }}"
+          cp target/release/melora dist/melora-linux-x86_64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: melora-linux-x86_64
+          path: dist/melora-linux-x86_64
+
+  android:
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: r27c
+      # Vendoring the SDK/NDK ourselves (rather than relying on whatever
+      # happens to be preinstalled on the runner image) so this build
+      # doesn't silently start failing -- or silently start using a
+      # different NDK/SDK version than what's actually been verified to
+      # work -- if the image changes.
+      ANDROID_HOME: ${{ github.workspace }}/.android-sdk
+      ANDROID_NDK_ROOT: ${{ github.workspace }}/.android-sdk/ndk/r27c
+      # i-slint-backend-android-activity's build script shells out to d8
+      # to dex a small Java shim; on JDK 21 (what actions/setup-java and
+      # this runner both default to) build-tools 34's d8 crashes with a
+      # NullPointerException -- a known Slint/Android issue
+      # (https://github.com/slint-ui/slint/issues/4973). Build-tools 35
+      # doesn't have the bug; downgrading Java is the other documented
+      # fix, but pinning a newer build-tools is less invasive here.
+      ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android-arm64
+
+      - name: Install Android NDK
+        run: |
+          curl -sS -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          mkdir -p "$(dirname "$ANDROID_NDK_ROOT")"
+          unzip -q /tmp/ndk.zip -d "$(dirname "$ANDROID_NDK_ROOT")"
+          mv "$(dirname "$ANDROID_NDK_ROOT")/android-ndk-${NDK_VERSION}" "$ANDROID_NDK_ROOT"
+          rm /tmp/ndk.zip
+
+      - name: Install Android SDK platform + build-tools
+        run: |
+          curl -sS -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          rm /tmp/cmdtools.zip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
+            "platforms;android-34" "platforms;android-30" "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" "platform-tools"
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk
+
+      # Debug-signed (cargo-apk auto-generates a debug keystore) rather
+      # than a Play Store release build -- this is for installing on a
+      # device to try it, not distribution. Release signing needs a real
+      # keystore managed as a secret; add `[package.metadata.android.signing.release]`
+      # and wire that up here if/when actual distribution is needed.
+      - name: Build APK
+        run: cargo apk build --target aarch64-linux-android --lib
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/debug/apk/melora.apk dist/melora-android-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melora-android-arm64
+          path: dist/melora-android-arm64.apk
 
   publish:
-    needs: build
+    needs: [linux, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

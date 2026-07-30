@@ -110,6 +110,16 @@ This is an early scaffold, not a daily driver yet. What works today:
   live: a page whose script sets `document.title = "Changed by JS"` shows
   that title in the real tab strip, not just in a unit test. See
   ARCHITECTURE.md for the exact scope and why it's drawn there.
+- **Builds for Android** (`aarch64-linux-android`) with no UI code
+  changes -- verified end to end: a real signed, installable `.apk` was
+  built from this codebase using `cargo-apk`, and the underlying Rust
+  code both checks and links cleanly for the target. Two real blockers
+  were found and fixed along the way (native-tls has no OpenSSL to link
+  against on Android; a JDK 21 + Android build-tools 34 combination hits
+  a known Slint bug in its dexer step) -- see ARCHITECTURE.md for both,
+  and for what's still unverified (no on-device/emulator test yet, and
+  the APK is debug-signed for sideloading, not release-signed for the
+  Play Store).
 
 All of the above was checked against a real running instance under Xvfb
 (driven with `xdotool`, screenshotted with `xwd`), not just unit-tested —
@@ -124,10 +134,12 @@ What's not wired up yet — see the roadmap in ARCHITECTURE.md:
   fixed — affected pages stop laying out fully partway through rather
   than crashing, which is progress but not a real fix.
 
-Platform target: Linux, Windows, and macOS, with no system rendering
-dependency on any of them. iOS is deliberately out of scope, not dropped
-quietly -- Apple requires all iOS browsers to render through WebKit, which
-would mean compromising on "self-contained" specifically there; see
+Platform target: Linux and Android today (both with no system rendering
+dependency), Windows and macOS previously verified building and not
+expected to have broken, just not currently in the release matrix -- see
+CI section below. iOS is deliberately out of scope, not dropped quietly
+-- Apple requires all iOS browsers to render through WebKit, which would
+mean compromising on "self-contained" specifically there; see
 ARCHITECTURE.md.
 
 ## Building
@@ -141,14 +153,26 @@ cargo run
 Requires a Rust toolchain with the 2024 edition (`rustc` ≥ 1.85) and, on
 Linux, the usual windowing libraries (X11/Wayland + `libxkbcommon`).
 
+To build the Android APK yourself: `rustup target add
+aarch64-linux-android`, install the Android NDK and SDK (build-tools
+35.0.0 specifically -- see ARCHITECTURE.md's Android section for why),
+`cargo install cargo-apk`, then `cargo apk build --target
+aarch64-linux-android --lib` from the repo root. The resulting APK lands
+at `target/debug/apk/melora.apk`, debug-signed and ready to `adb install`
+or copy to a device to sideload.
+
 ## CI and downloadable builds
 
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs `cargo
-build`/`cargo test` on every push and pull request.
-[`.github/workflows/release.yml`](./.github/workflows/release.yml)
-builds release binaries for Linux, Windows, and macOS and attaches them
-to a GitHub Release whenever a `v*` tag is pushed -- that's how to get an
-actual binary to try without building from source yourself.
+build`/`cargo test` on Linux on every push and pull request.
+[`.github/workflows/release.yml`](./.github/workflows/release.yml) builds
+a Linux x86_64 binary and an Android arm64 APK and attaches both to a
+GitHub Release whenever a `v*` tag is pushed -- that's how to get an
+actual build to try without building from source yourself. (Windows and
+macOS were in this matrix earlier and built successfully then; they're
+not in it right now since the immediate need was specifically a desktop
+build and a phone-testable Android build -- re-adding them is a small,
+independent change whenever they're wanted again.)
 
 ## License
 
