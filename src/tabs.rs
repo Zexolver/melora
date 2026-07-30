@@ -5,13 +5,28 @@ use blitz_dom::net::Resource;
 use blitz_traits::net::NetProvider;
 
 use crate::engine::PageEngine;
+use crate::session::SessionTab;
+use crate::swap::{SwapFile, SwapSlot};
 
 pub type TabId = u64;
+
+/// How many compressed tabs are allowed to keep their LZ4 bytes in RAM
+/// before the coldest ones get spilled to `TabManager::swap` instead --
+/// the disk-backed tier underneath the RAM one. 32 is a lot more than
+/// `max_active` (so recently-backgrounded tabs stay in fast RAM) while
+/// still bounding RAM use for sessions with hundreds of tabs open. See
+/// `TabManager::set_ram_compressed_budget` for overriding it (tests only
+/// -- real usage always wants the default).
+const DEFAULT_RAM_COMPRESSED_BUDGET: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TabState {
     Active,
+    /// LZ4-compressed source HTML held in RAM.
     Compressed,
+    /// LZ4-compressed source HTML written to `TabManager::swap` (disk)
+    /// instead of kept in RAM -- the coldest tier.
+    Swapped,
 }
 
 /// Outcome of trying to wake a tab. See [`TabManager::activate`].
@@ -19,9 +34,13 @@ pub enum TabState {
 pub enum WakeResult {
     /// Was already active; just marked most-recently-used.
     AlreadyActive,
-    /// Was compressed; decompressed and re-parsed locally, no network
-    /// needed.
+    /// Was compressed in RAM; decompressed and re-parsed locally, no
+    /// network needed.
     WokeFromCompressed,
+    /// Was compressed on disk (the swap tier); read back, decompressed,
+    /// and re-parsed locally -- still no network needed, just a little
+    /// disk I/O the RAM-only case doesn't pay.
+    WokeFromSwap,
     /// No local snapshot exists (shouldn't happen for a tab that has ever
     /// successfully loaded something) -- caller must fetch over the
     /// network and apply it with `TabManager::force_activate`.
@@ -45,6 +64,9 @@ pub struct Tab {
     /// Decompressing and re-parsing this is the whole point of this
     /// hibernation tier: waking a tab needs no network round-trip.
     compressed_html: Option<Vec<u8>>,
+    /// Where this tab's LZ4-compressed HTML lives in `TabManager::swap`,
+    /// present only while `state == Swapped`.
+    swap_slot: Option<SwapSlot>,
 }
 
 impl Tab {
@@ -118,6 +140,10 @@ pub struct TabManager {
     /// `set_resource_provider` in the real app. Left unset in tests, which
     /// use self-contained HTML with no sub-resources to fetch.
     resource_provider: Option<Arc<dyn NetProvider<Resource>>>,
+    /// The disk-backed overflow tier underneath the RAM-compressed one --
+    /// see `TabState::Swapped` and `swap.rs`.
+    swap: SwapFile,
+    ram_compressed_budget: usize,
 }
 
 impl TabManager {
@@ -129,11 +155,22 @@ impl TabManager {
             max_active,
             viewport,
             resource_provider: None,
+            swap: SwapFile::new().expect("failed to create melora's swap file"),
+            ram_compressed_budget: DEFAULT_RAM_COMPRESSED_BUDGET,
         }
     }
 
     pub fn set_resource_provider(&mut self, provider: Arc<dyn NetProvider<Resource>>) {
         self.resource_provider = Some(provider);
+    }
+
+    /// Overrides how many compressed tabs may stay in RAM before the
+    /// coldest are spilled to disk. Test-only: real usage always wants
+    /// `DEFAULT_RAM_COMPRESSED_BUDGET`, but exercising the swap tier in a
+    /// test without opening dozens of tabs needs a much smaller budget.
+    #[cfg(test)]
+    pub(crate) fn set_ram_compressed_budget(&mut self, budget: usize) {
+        self.ram_compressed_budget = budget;
     }
 
     pub fn viewport(&self) -> (u32, u32) {
@@ -156,6 +193,7 @@ impl TabManager {
             engine: Some(engine),
             source_html: Some(html.as_bytes().to_vec()),
             compressed_html: None,
+            swap_slot: None,
         });
         self.lru.push_back(id);
         self.enforce_budget();
@@ -177,6 +215,7 @@ impl TabManager {
             tab.engine = Some(engine);
             tab.source_html = Some(html.as_bytes().to_vec());
             tab.compressed_html = None;
+            tab.swap_slot = None;
             tab.state = TabState::Active;
         }
         self.lru.retain(|&t| t != id);
@@ -198,8 +237,19 @@ impl TabManager {
         }
 
         let url = tab.url.clone();
-        let Some(compressed) = tab.compressed_html.take() else {
-            return WakeResult::NeedsRefetch;
+        let state = tab.state;
+        let ram_bytes = tab.compressed_html.take();
+        let swap_slot = tab.swap_slot.take();
+
+        let compressed = match (ram_bytes, swap_slot) {
+            (Some(bytes), _) => bytes,
+            (None, Some(slot)) => {
+                let Ok(bytes) = self.swap.read(slot) else {
+                    return WakeResult::NeedsRefetch;
+                };
+                bytes
+            }
+            (None, None) => return WakeResult::NeedsRefetch,
         };
         let Ok(bytes) = lz4_flex::decompress_size_prepended(&compressed) else {
             return WakeResult::NeedsRefetch;
@@ -218,7 +268,11 @@ impl TabManager {
         self.lru.push_back(id);
         self.enforce_budget();
 
-        WakeResult::WokeFromCompressed
+        if state == TabState::Swapped {
+            WakeResult::WokeFromSwap
+        } else {
+            WakeResult::WokeFromCompressed
+        }
     }
 
     /// Escape hatch for `WakeResult::NeedsRefetch`: force-loads freshly
@@ -334,26 +388,57 @@ impl TabManager {
     }
 
     /// Demotes the least-recently-used active tabs beyond `max_active` to
-    /// the compressed tier: their engine is dropped and their source HTML
-    /// is LZ4-compressed in its place.
+    /// the compressed tier (their engine is dropped and their source HTML
+    /// is LZ4-compressed in its place), then, if that leaves more than
+    /// `ram_compressed_budget` tabs holding compressed bytes in RAM,
+    /// spills the coldest of those to the disk-backed swap tier instead.
     fn enforce_budget(&mut self) {
         let active_count = self.tabs.iter().filter(|t| t.state == TabState::Active).count();
-        if active_count <= self.max_active {
+        if active_count > self.max_active {
+            let mut to_demote = active_count - self.max_active;
+            for id in self.lru.iter() {
+                if to_demote == 0 {
+                    break;
+                }
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == *id) {
+                    if tab.state == TabState::Active {
+                        if let Some(bytes) = tab.source_html.take() {
+                            tab.compressed_html = Some(lz4_flex::compress_prepend_size(&bytes));
+                        }
+                        tab.engine = None;
+                        tab.state = TabState::Compressed;
+                        to_demote -= 1;
+                    }
+                }
+            }
+        }
+
+        let ram_compressed_count = self.tabs.iter().filter(|t| t.state == TabState::Compressed).count();
+        if ram_compressed_count <= self.ram_compressed_budget {
             return;
         }
-        let mut to_demote = active_count - self.max_active;
+        let mut to_swap = ram_compressed_count - self.ram_compressed_budget;
         for id in self.lru.iter() {
-            if to_demote == 0 {
+            if to_swap == 0 {
                 break;
             }
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == *id) {
-                if tab.state == TabState::Active {
-                    if let Some(bytes) = tab.source_html.take() {
-                        tab.compressed_html = Some(lz4_flex::compress_prepend_size(&bytes));
+                if tab.state == TabState::Compressed {
+                    if let Some(bytes) = tab.compressed_html.take() {
+                        match self.swap.write(&bytes) {
+                            Ok(slot) => {
+                                tab.swap_slot = Some(slot);
+                                tab.state = TabState::Swapped;
+                                to_swap -= 1;
+                            }
+                            Err(_) => {
+                                // Disk write failed (e.g. no space left) --
+                                // keep the tab's bytes in RAM rather than
+                                // lose them.
+                                tab.compressed_html = Some(bytes);
+                            }
+                        }
                     }
-                    tab.engine = None;
-                    tab.state = TabState::Compressed;
-                    to_demote -= 1;
                 }
             }
         }
@@ -375,11 +460,90 @@ impl TabManager {
         self.tabs.iter().filter(|t| t.state == TabState::Compressed).count()
     }
 
-    /// Total bytes currently held in compressed snapshots, across every
-    /// compressed tab. A concrete, computed measure of what the
+    pub fn swapped_count(&self) -> usize {
+        self.tabs.iter().filter(|t| t.state == TabState::Swapped).count()
+    }
+
+    /// Total bytes currently held in compressed snapshots in RAM, across
+    /// every compressed tab. A concrete, computed measure of what the
     /// "hundreds of tabs, very little RAM" claim actually costs.
     pub fn total_compressed_bytes(&self) -> usize {
         self.tabs.iter().map(Tab::compressed_bytes).sum()
+    }
+
+    /// Total bytes currently held in the disk-backed swap tier. Read
+    /// straight from each tab's slot length, no disk I/O needed.
+    pub fn total_swapped_bytes(&self) -> usize {
+        self.tabs.iter().filter_map(|t| t.swap_slot).map(|s| s.len as usize).sum()
+    }
+
+    /// Builds a session snapshot of every open tab -- enough to fully
+    /// reconstruct each one (LZ4-compressed HTML plus url/title/history)
+    /// regardless of which tier it's currently in, including reading any
+    /// swapped-to-disk tabs back in. `active_id` marks which tab was on
+    /// screen, so a restore can bring the same one back to the front.
+    pub fn session_snapshot(&mut self, active_id: Option<TabId>) -> Vec<SessionTab> {
+        let mut out = Vec::with_capacity(self.tabs.len());
+        for i in 0..self.tabs.len() {
+            let tab = &self.tabs[i];
+            let id = tab.id;
+            let url = tab.url.clone();
+            let title = tab.title.clone();
+            let history = tab.history.clone();
+            let history_pos = tab.history_pos;
+            let state = tab.state;
+            let ram_bytes = tab.compressed_html.clone();
+            let swap_slot = tab.swap_slot;
+            let source_html = tab.source_html.clone();
+
+            let compressed_html = match state {
+                TabState::Active => source_html.map(|bytes| lz4_flex::compress_prepend_size(&bytes)),
+                TabState::Compressed => ram_bytes,
+                TabState::Swapped => swap_slot.and_then(|slot| self.swap.read(slot).ok()),
+            };
+
+            let Some(compressed_html) = compressed_html else { continue };
+            out.push(SessionTab {
+                url,
+                title,
+                history,
+                history_pos,
+                active: Some(id) == active_id,
+                compressed_html,
+            });
+        }
+        out
+    }
+
+    /// Reconstructs tabs from a saved session, in the compressed tier (no
+    /// live engine parsed yet -- restoring a session with hundreds of
+    /// tabs shouldn't parse and lay out all of them up front). Returns
+    /// the id of whichever tab was marked active when the session was
+    /// saved, if any; the caller should `activate` it to bring it live.
+    pub fn restore_session(&mut self, tabs: Vec<SessionTab>) -> Option<TabId> {
+        let mut restored_active = None;
+        for t in tabs {
+            let id = self.next_id;
+            self.next_id += 1;
+            if t.active {
+                restored_active = Some(id);
+            }
+            self.tabs.push(Tab {
+                id,
+                title: t.title,
+                url: t.url,
+                state: TabState::Compressed,
+                history: t.history,
+                history_pos: t.history_pos,
+                engine: None,
+                source_html: None,
+                compressed_html: Some(t.compressed_html),
+                swap_slot: None,
+            });
+            self.lru.push_back(id);
+        }
+        self.enforce_budget();
+        restored_active
     }
 }
 
@@ -478,11 +642,17 @@ mod tests {
         }
         assert_eq!(mgr.tabs().len(), 300);
         assert_eq!(mgr.active_count(), 8);
-        assert_eq!(mgr.compressed_count(), 292);
+        // The 292 non-active tabs split across the two hibernation tiers:
+        // the most recently backgrounded stay RAM-compressed up to the
+        // budget, the rest spill to the disk swap tier underneath it.
+        assert_eq!(mgr.compressed_count() + mgr.swapped_count(), 292);
+        assert!(mgr.compressed_count() <= 32);
+        assert!(mgr.swapped_count() > 0, "300 tabs should be enough to exercise the swap tier too");
 
-        // 292 compressed tabs of a ~1.6KB page should total well under 1MB,
-        // not 292 live engines' worth of DOM/style/layout state.
-        let total = mgr.total_compressed_bytes();
+        // 292 compressed tabs of a ~1.6KB page should total well under 1MB
+        // combined across both tiers, not 292 live engines' worth of
+        // DOM/style/layout state.
+        let total = mgr.total_compressed_bytes() + mgr.total_swapped_bytes();
         assert!(total > 0);
         assert!(
             total < page.len() * 292,
@@ -566,5 +736,87 @@ mod tests {
 
         assert!(!mgr.apply_resource(doc_id + 12345, Resource::None));
         assert!(mgr.apply_resource(doc_id, Resource::None));
+    }
+
+    #[test]
+    fn compressed_tabs_beyond_the_ram_budget_spill_to_the_disk_swap_tier() {
+        let mut mgr = TabManager::new(1, (800, 600));
+        mgr.set_ram_compressed_budget(2);
+        let page = repetitive_page(20);
+
+        let a = mgr.open_tab("a", &page); // demoted to Compressed by b
+        mgr.open_tab("b", DEMO);
+        mgr.open_tab("c", DEMO); // demotes b to Compressed -- ram budget (2) not yet exceeded
+        mgr.open_tab("d", DEMO); // demotes c -- 3 compressed now, budget 2: a (LRU) spills to swap
+
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Swapped);
+        assert_eq!(mgr.tab(a).unwrap().compressed_bytes(), 0, "swapped tabs hold no RAM copy");
+        assert!(mgr.total_swapped_bytes() > 0);
+        assert_eq!(mgr.swapped_count(), 1);
+    }
+
+    #[test]
+    fn waking_a_swapped_tab_reads_it_back_from_disk() {
+        let mut mgr = TabManager::new(1, (800, 600));
+        mgr.set_ram_compressed_budget(1);
+        let page = repetitive_page(20);
+
+        let a = mgr.open_tab("a", &page);
+        let original_node_count = mgr.tab(a).unwrap().node_count();
+        mgr.open_tab("b", DEMO); // demotes a to Compressed
+        mgr.open_tab("c", DEMO); // 2 compressed (a, b) > budget 1: a spills to swap
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Swapped);
+
+        let result = mgr.activate(a);
+
+        assert_eq!(result, WakeResult::WokeFromSwap);
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Active);
+        assert_eq!(mgr.tab(a).unwrap().node_count(), original_node_count);
+    }
+
+    #[test]
+    fn session_snapshot_and_restore_round_trips_url_title_history_and_content() {
+        let mut mgr = TabManager::new(4, (800, 600));
+        let a = mgr.open_tab("a", DEMO);
+        mgr.navigate(a, "a/2", DEMO);
+        let original_node_count = mgr.tab(a).unwrap().node_count();
+
+        let snapshot = mgr.session_snapshot(Some(a));
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].url, "a/2");
+        assert_eq!(snapshot[0].history, vec!["a".to_string(), "a/2".to_string()]);
+        assert_eq!(snapshot[0].history_pos, 1);
+        assert!(snapshot[0].active);
+
+        let mut restored = TabManager::new(4, (800, 600));
+        let active = restored.restore_session(snapshot);
+        assert_eq!(restored.tabs().len(), 1);
+        let restored_id = restored.tabs()[0].id;
+        assert_eq!(active, Some(restored_id));
+        assert_eq!(restored.tab(restored_id).unwrap().state, TabState::Compressed);
+
+        // Restored tabs start compressed (no engine parsed yet); waking
+        // the previously-active one should reproduce the same page.
+        assert_eq!(restored.activate(restored_id), WakeResult::WokeFromCompressed);
+        assert_eq!(restored.tab(restored_id).unwrap().node_count(), original_node_count);
+        assert_eq!(restored.tab(restored_id).unwrap().url, "a/2");
+    }
+
+    #[test]
+    fn session_snapshot_includes_swapped_tabs_by_reading_them_back_from_disk() {
+        let mut mgr = TabManager::new(1, (800, 600));
+        mgr.set_ram_compressed_budget(0);
+        let page = repetitive_page(20);
+        let a = mgr.open_tab("a", &page);
+        mgr.open_tab("b", DEMO); // demotes a; ram budget 0 immediately spills it to swap
+        assert_eq!(mgr.tab(a).unwrap().state, TabState::Swapped);
+
+        let snapshot = mgr.session_snapshot(None);
+        let a_snapshot = snapshot.iter().find(|t| t.url == "a").unwrap();
+        assert!(!a_snapshot.compressed_html.is_empty());
+        assert_eq!(
+            lz4_flex::decompress_size_prepended(&a_snapshot.compressed_html).unwrap(),
+            page.as_bytes()
+        );
     }
 }

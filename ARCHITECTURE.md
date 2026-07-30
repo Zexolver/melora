@@ -147,8 +147,8 @@ Verified in `src/tabs.rs`'s tests:
   storing them uncompressed would be.
 
 The status bar surfaces this directly (`format_bytes` in `main.rs`): e.g.
-"300 tabs · 8 active · 292 compressed (14.2 KB)" — a computed number, not a
-claim.
+"300 tabs · 8 active · 292 compressed (14.2 KB) · 0 swapped (0 B)" — a
+computed number, not a claim.
 
 **On "more RAM-efficient than other browsers":** the compression tier is
 a real, measured improvement over Melora's own previous discard-based
@@ -157,6 +157,121 @@ works in general. What isn't done, and shouldn't be claimed, is a
 head-to-head memory benchmark against Chrome/Firefox/Safari — that needs
 real profiling on real hardware outside this environment, not a number
 invented here.
+
+## The disk swap tier (a third tier underneath RAM compression)
+
+The RAM-compressed tier above still holds one LZ4 blob per background tab
+in memory. For a session with hundreds of tabs, even that adds up, so
+there's a second hibernation tier underneath it: `swap.rs`'s `SwapFile`,
+a small on-disk overflow file. Once more than `ram_compressed_budget`
+(32, `DEFAULT_RAM_COMPRESSED_BUDGET` in `src/tabs.rs`) tabs are RAM-
+compressed, `TabManager::enforce_budget` writes the coldest ones' bytes
+to this file instead and moves them to `TabState::Swapped`
+(`Tab::swap_slot` records where). Waking a swapped tab
+(`TabManager::activate`) reads those bytes back, decompresses, and
+re-parses -- the same "no network round-trip" property the RAM tier has,
+just with a little disk I/O the RAM case doesn't pay. This is the
+literal "small swapfile" the browser was asked to have: OS-level zram
+compresses cold *process* memory; this compresses cold *tab* memory one
+level further, to disk, using the same LZ4 representation as the RAM
+tier so the two are just two ends of one spectrum, not two designs.
+
+Deliberately simple, and documented as such rather than hidden: the swap
+file is append-only for the lifetime of one run (space from a tab that
+wakes or closes is never reclaimed -- a real allocator would track a
+free list) and is deleted on process exit (`SwapFile`'s `Drop`), because
+it's a RAM extension for the *current* run, not persistent storage --
+see Session persistence below for the separate mechanism that actually
+survives a restart. If the disk write itself fails (e.g. no space left),
+`enforce_budget` leaves the tab's bytes in RAM rather than losing them.
+
+Verified in `src/tabs.rs`'s tests:
+- `compressed_tabs_beyond_the_ram_budget_spill_to_the_disk_swap_tier` —
+  demotes enough tabs to exceed a (test-only, lowered) RAM budget and
+  checks the overflow actually lands in `TabState::Swapped` with an
+  empty RAM footprint.
+- `waking_a_swapped_tab_reads_it_back_from_disk` — wakes a swapped tab
+  with no HTML supplied and checks it reconstructs to the same node
+  count, the same "no network" proof the RAM-tier test does.
+
+Verified live, not just in tests: opening enough tabs in the real running
+app (under Xvfb) to exceed the RAM budget produced real entries in the
+"swapped" stat in the status bar, and clicking one of those tabs back
+into view worked -- woke it, decremented the swapped count, incremented
+active, and rendered its real content. This same session also caught a
+real bug, described under Session persistence below.
+
+## Session persistence (surviving a restart)
+
+`session.rs`'s `SessionStore` is what makes "tabs survive a restart" a
+reality rather than a request for a permanent RAM extension. It's a
+distinct file from `SwapFile` on purpose: swap is ephemeral and deleted
+on exit; the session file lives in a real per-user data directory
+(`$XDG_DATA_HOME`/`~/.local/share`, `~/Library/Application Support`, or
+`%APPDATA%` depending on platform -- resolved by hand in `data_dir()`
+rather than pulling in a `directories` crate, consistent with this
+project's "no dependency it doesn't need" approach) and is meant to
+outlive the process.
+
+**What's saved:** `TabManager::session_snapshot` builds one record per
+open tab -- url, title, history, history position, and LZ4-compressed
+HTML -- regardless of which tier the tab is currently in (`Active`
+tabs get their live HTML compressed fresh; `Compressed` tabs' bytes are
+already in the right form; `Swapped` tabs get read back from disk).
+`main.rs` calls this and writes the result after essentially every
+tab-mutating action (`persist_session`, called after every `refresh` in
+`main.rs`), not just on a clean exit -- so the saved session reflects
+reality even if the process is later killed rather than closed properly.
+Saves are best-effort (`let _ = session_store.save(...)`): a failure to
+persist shouldn't interrupt browsing, only lose the ability to restore.
+
+**What happens at startup:** before opening any tab, `main` calls
+`SessionStore::load`. If it's empty (first run, or the last run already
+restored/discarded), Melora opens `melora://start` as before. If it's
+not, nothing is opened yet -- instead the chrome shows a modal prompt
+("N tab(s) from your last session are still residing. Restore them?",
+the "popup mentioning residing tabs" this feature was asked for) with
+**Restore** and **Start Fresh** buttons (`show-restore-prompt` /
+`restore-prompt-text` properties and `restore-session` / `discard-session`
+callbacks in `melora.slint`, a conditional overlay `Rectangle` declared
+after the main layout so it paints on top). Restoring calls
+`TabManager::restore_session`, which reconstructs every tab directly in
+the `Compressed` tier (skipping a live parse for tabs that may not be
+looked at for a while -- restoring hundreds of tabs shouldn't lay all of
+them out up front) and returns whichever tab was marked active when the
+session was saved, which the caller then `activate`s to bring live.
+Declining clears the stale session file and starts fresh, same as a
+first run.
+
+Verified in `src/tabs.rs`'s tests
+(`session_snapshot_and_restore_round_trips_url_title_history_and_content`,
+`session_snapshot_includes_swapped_tabs_by_reading_them_back_from_disk`)
+and in `src/session.rs`'s own tests (round-tripping the on-disk binary
+format, a corrupt file being reported as an error rather than silently
+treated as empty, `clear` being a no-op when there's nothing to clear).
+
+**Verified live, and it caught a real bug.** Opening 45 tabs in the real
+app, quitting, and relaunching produced the actual restore prompt ("45
+tab(s) from your last session are still residing"), and clicking Restore
+correctly reconstructed all 45 (status bar: "45 tabs · 1 active · 31
+compressed · 13 swapped", matching the pre-restart tiering) with the
+same tab active as before. Clicking one of the restored background tabs
+to wake it, though, crashed the process the first time: `main.rs`'s
+`on_activate_tab` handler had `match manager.borrow_mut().activate(id) {
+... }`, and Rust's temporary-lifetime rules keep the `RefMut` from
+`borrow_mut()` alive for the *entire* match, not just the scrutinee --
+so the moment an arm called `manager.borrow()` (to refresh the UI), the
+`RefCell` panicked with "already mutably borrowed". This is a well-known
+Rust footgun, and the pattern predates this milestone -- it just hadn't
+been live-exercised before, because waking a compressed/swapped tab via
+a real click had never actually been part of an earlier live-verification
+pass. Fixed by binding the match scrutinee to a local first
+(`let result = manager.borrow_mut().activate(id); match result { ... }`),
+which drops the borrow before the match body runs. Confirmed by
+re-running the exact steps that crashed it -- restore 45 tabs, click a
+background tab -- and seeing it wake correctly (swapped count
+decrementing, the real page content appearing) with the process still
+alive afterward.
 
 ## Networking
 
@@ -405,30 +520,31 @@ values, so there's nothing for the collector to need to trace into.
 
 ## What's still stubbed, and why
 
-- **Persisting compressed tabs across restarts.** A session's hundreds of
-  compressed snapshots live in memory only; closing Melora loses them, so
-  reopening means re-fetching everything. Roadmap item, not attempted yet.
 - **JavaScript is real but narrow.** See the JavaScript section above --
   `console`/`document.title` only, no DOM API, no events, no timers, no
   network from script.
+- **The disk swap tier never reclaims space within a run.** See the disk
+  swap tier section above -- append-only by design, deleted whole on
+  exit; a real free-list is future work if it ever matters in practice.
 
 ## Roadmap (rough order)
 
 1. Report or work around the `blitz-dom` table-layout panic upstream, so
    affected pages (like pypi.org) render fully instead of stopping partway
    through layout once it's hit (contained now, not yet fixed).
-2. Persist compressed-tab snapshots to disk so a session with hundreds of
-   tabs survives a restart without re-fetching everything at once.
-3. Revisit memory/CPU budgets with real profiling data instead of the
-   current fixed `max_active = 8` constant.
-4. Decide gosub-engine's role: it has its own layout/render pipeline
+2. Revisit memory/CPU budgets with real profiling data instead of the
+   current fixed `max_active = 8` / `ram_compressed_budget = 32` constants.
+3. Decide gosub-engine's role: it has its own layout/render pipeline
    (`gosub_render_pipeline`, `gosub_renderer_vello`) and even a JS engine
    binding (`gosub_v8`) that Blitz doesn't — evaluate whether it should
    replace Blitz as the primary engine, run as a selectable second engine,
    or stay as reference-only. Not decided yet; `tests/gosub_html5_smoke.rs`
    is the groundwork for making that call with real data instead of a
    guess.
-5. Grow the JS binding surface beyond `console`/`document.title` -- a real
+4. Grow the JS binding surface beyond `console`/`document.title` -- a real
    `getElementById`/DOM-mutation API, once there's a design for keeping
    `blitz-dom`'s tree and Boa's JS values in sync safely -- rather than
    the deliberately narrow bindings in place now.
+5. Give the disk swap tier a real free list, if profiling ever shows the
+   append-only growth within a single long-running session actually
+   matters.

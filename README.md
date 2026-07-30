@@ -26,15 +26,29 @@ This is an early scaffold, not a daily driver yet. What works today:
 - A real HTML parse → style → layout pipeline (via [Blitz](https://github.com/DioxusLabs/blitz),
   which itself is built from `html5ever`, `cssparser`/`selectors`, Stylo, and
   Taffy — components with roots in Servo's dormant years) driving every tab.
-- Tab compression: only the `N` most-recently-used tabs keep a live parsed
-  document in memory; the rest are demoted to an LZ4-compressed copy of
-  their source HTML in RAM and reconstructed locally on demand -- no
-  network needed to restore a tab, unlike a browser that discards and
-  re-fetches. Covered by tests including one that opens 300 tabs and
-  checks both that only the budgeted few stay resident *and* that the
-  total compressed footprint of the other 292 is far smaller than storing
-  them uncompressed. See ARCHITECTURE.md for what this is and isn't
-  (compresses source HTML and re-parses, not a live execution snapshot).
+- Tab compression, in **three tiers**: only the `N` most-recently-used
+  tabs keep a live parsed document in memory; the next tier is demoted to
+  an LZ4-compressed copy of their source HTML in RAM; and once too many
+  of those pile up, the coldest spill to a small on-disk swap file
+  instead -- the browser's own swap, layered under the RAM one, freeing
+  RAM further without needing the network. Waking a tab from either
+  hibernation tier reconstructs it locally, no network round-trip, unlike
+  a browser that discards and re-fetches. Covered by tests including one
+  that opens 300 tabs and checks tabs land in the right tier and that the
+  combined compressed footprint of the 292 non-active ones is far smaller
+  than storing them uncompressed. See ARCHITECTURE.md for what this is
+  and isn't (compresses source HTML and re-parses, not a live execution
+  snapshot).
+- **Tabs survive a restart.** The open tabs (url, title, history, and a
+  compressed snapshot of each, read back from whichever tier it was in)
+  are saved to a real per-user data directory as browsing happens, not
+  just on a clean exit. On the next launch, a prompt offers to restore
+  them ("N tab(s) from your last session are still residing. Restore
+  them?") or start fresh. Verified live: opened 45 tabs (enough to
+  exercise all three tiers), quit, relaunched, saw the real prompt with
+  the right count, restored, and got all 45 back with the same one
+  active -- which also caught and fixed a real `RefCell` double-borrow
+  crash on waking a restored background tab; see ARCHITECTURE.md.
 - Per-tab back/forward history.
 - Real HTTP(S) fetching (`src/net.rs`, via `blitz-net`): typing an address,
   reload, back/forward, and (as a fallback only -- waking normally comes
@@ -89,7 +103,6 @@ What's not wired up yet — see the roadmap in ARCHITECTURE.md:
 - JavaScript is real but narrow: `console`/`document.title` only, no DOM
   API, so anything that needs real client-side rendering (beyond setting
   the page title or logging) won't appear.
-- Compressed tabs live in memory only; they don't survive a restart.
 - The underlying `blitz-dom` table-layout bug above is contained, not
   fixed — affected pages stop laying out fully partway through rather
   than crashing, which is progress but not a real fix.

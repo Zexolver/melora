@@ -1,6 +1,8 @@
 mod engine;
 mod js;
 mod net;
+mod session;
+mod swap;
 mod tabs;
 
 slint::include_modules!();
@@ -78,18 +80,20 @@ fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) 
             title: t.title.clone().into(),
             url: t.url.clone().into(),
             active: Some(t.id) == active_id,
-            compressed: t.state == TabState::Compressed,
+            compressed: t.state != TabState::Active,
         })
         .collect();
     window.set_tabs(ModelRc::new(VecModel::from(items)));
 
     window.set_status_text(
         format!(
-            "{} tabs · {} active · {} compressed ({})",
+            "{} tabs · {} active · {} compressed ({}) · {} swapped ({})",
             manager.tabs().len(),
             manager.active_count(),
             manager.compressed_count(),
             format_bytes(manager.total_compressed_bytes()),
+            manager.swapped_count(),
+            format_bytes(manager.total_swapped_bytes()),
         )
         .into(),
     );
@@ -105,6 +109,15 @@ fn refresh(window: &MainWindow, manager: &TabManager, active_id: Option<TabId>) 
     }
 }
 
+/// Snapshots every open tab and writes it to disk, so the next launch can
+/// offer to restore this session. Best-effort: a failure here (disk full,
+/// permissions) is swallowed rather than interrupting browsing -- losing
+/// the ability to restore tabs is much less bad than crashing over it.
+fn persist_session(session_store: &session::SessionStore, manager: &Rc<RefCell<TabManager>>, active_id: Option<TabId>) {
+    let snapshot = manager.borrow_mut().session_snapshot(active_id);
+    let _ = session_store.save(&snapshot);
+}
+
 /// Starts loading `intent`'s target into tab `id`. A `melora://` page is
 /// applied immediately (no network needed); anything else is handed to the
 /// network layer, and the result is applied later, when the timer loop in
@@ -115,6 +128,7 @@ fn start_load(
     network: &net::Network,
     manager: &Rc<RefCell<TabManager>>,
     window: &MainWindow,
+    session_store: &session::SessionStore,
 ) {
     let target = intent.target().to_string();
 
@@ -123,6 +137,7 @@ fn start_load(
         intent.apply(&mut mgr, id, &html);
         drop(mgr);
         refresh(window, &manager.borrow(), Some(id));
+        persist_session(session_store, manager, Some(id));
         return;
     }
 
@@ -136,6 +151,7 @@ fn start_load(
             intent.apply(&mut mgr, id, &error_page_html(&target, &message));
             drop(mgr);
             refresh(window, &manager.borrow(), Some(id));
+            persist_session(session_store, manager, Some(id));
         }
     }
 }
@@ -148,10 +164,25 @@ fn main() {
     let network = Rc::new(network);
     manager.borrow_mut().set_resource_provider(network.resource_provider());
 
-    {
+    let session_store = Rc::new(session::SessionStore::new());
+    // A prior run's tabs, if any, held here until the user answers the
+    // restore prompt below -- not applied to `manager` yet, so opening the
+    // window doesn't briefly show them then replace them.
+    let pending_session = Rc::new(RefCell::new(session_store.load().unwrap_or_default()));
+
+    if pending_session.borrow().is_empty() {
         let mut mgr = manager.borrow_mut();
         let id = mgr.open_tab("melora://start", &local_page_html("melora://start").unwrap());
         active_id.set(Some(id));
+    } else {
+        window.set_show_restore_prompt(true);
+        window.set_restore_prompt_text(
+            format!(
+                "{} tab(s) from your last session are still residing. Restore them?",
+                pending_session.borrow().len()
+            )
+            .into(),
+        );
     }
     refresh(&window, &manager.borrow(), active_id.get());
 
@@ -164,6 +195,7 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let session_store = session_store.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(50),
@@ -188,6 +220,7 @@ fn main() {
                 }
                 if applied {
                     refresh(&window, &manager.borrow(), active_id.get());
+                    persist_session(&session_store, &manager, active_id.get());
                 }
             },
         );
@@ -197,12 +230,15 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let session_store = session_store.clone();
         window.on_new_tab(move || {
             let window = window_weak.unwrap();
             let mut mgr = manager.borrow_mut();
             let id = mgr.open_tab("melora://new-tab", &local_page_html("melora://new-tab").unwrap());
             active_id.set(Some(id));
-            refresh(&window, &mgr, active_id.get());
+            drop(mgr);
+            refresh(&window, &manager.borrow(), active_id.get());
+            persist_session(&session_store, &manager, active_id.get());
         });
     }
 
@@ -210,6 +246,7 @@ fn main() {
         let window_weak = window.as_weak();
         let manager = manager.clone();
         let active_id = active_id.clone();
+        let session_store = session_store.clone();
         window.on_close_tab(move |id| {
             let window = window_weak.unwrap();
             let mut mgr = manager.borrow_mut();
@@ -218,7 +255,56 @@ fn main() {
             if active_id.get() == Some(id) {
                 active_id.set(mgr.tabs().last().map(|t| t.id));
             }
-            refresh(&window, &mgr, active_id.get());
+            drop(mgr);
+            refresh(&window, &manager.borrow(), active_id.get());
+            persist_session(&session_store, &manager, active_id.get());
+        });
+    }
+
+    // Session restore prompt: shown at startup only when a prior run left
+    // tabs behind (see `pending_session` above). Restoring reconstructs
+    // them in the compressed tier and wakes whichever was on screen when
+    // the session was saved; declining just clears the stale session file
+    // and starts fresh, same as a first run.
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        let session_store = session_store.clone();
+        let pending_session = pending_session.clone();
+        window.on_restore_session(move || {
+            let window = window_weak.unwrap();
+            let tabs = std::mem::take(&mut *pending_session.borrow_mut());
+            let mut mgr = manager.borrow_mut();
+            let restored_active = mgr.restore_session(tabs);
+            let to_activate = restored_active.or_else(|| mgr.tabs().first().map(|t| t.id));
+            if let Some(id) = to_activate {
+                mgr.activate(id);
+            }
+            active_id.set(to_activate);
+            drop(mgr);
+            window.set_show_restore_prompt(false);
+            refresh(&window, &manager.borrow(), active_id.get());
+            persist_session(&session_store, &manager, active_id.get());
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let manager = manager.clone();
+        let active_id = active_id.clone();
+        let session_store = session_store.clone();
+        let pending_session = pending_session.clone();
+        window.on_discard_session(move || {
+            let window = window_weak.unwrap();
+            pending_session.borrow_mut().clear();
+            let _ = session_store.clear();
+            let mut mgr = manager.borrow_mut();
+            let id = mgr.open_tab("melora://start", &local_page_html("melora://start").unwrap());
+            active_id.set(Some(id));
+            drop(mgr);
+            window.set_show_restore_prompt(false);
+            refresh(&window, &manager.borrow(), active_id.get());
         });
     }
 
@@ -227,21 +313,36 @@ fn main() {
         let manager = manager.clone();
         let active_id = active_id.clone();
         let network = network.clone();
+        let session_store = session_store.clone();
         window.on_activate_tab(move |id| {
             let window = window_weak.unwrap();
             let id = id as TabId;
             active_id.set(Some(id));
 
-            // Tries the local compressed snapshot first -- no network
-            // involved in the common case. Only falls back to a real
-            // fetch if a tab somehow has no snapshot to wake from.
-            match manager.borrow_mut().activate(id) {
-                tabs::WakeResult::AlreadyActive | tabs::WakeResult::WokeFromCompressed => {
+            // Tries the local compressed/swapped snapshot first -- no
+            // network involved in the common case. Only falls back to a
+            // real fetch if a tab somehow has no snapshot to wake from.
+            //
+            // Bound to `result` first, rather than matched on directly:
+            // `match manager.borrow_mut().activate(id) { ... }` keeps the
+            // `RefMut` temporary alive for the whole match (a well-known
+            // Rust footgun), which then panics ("already mutably
+            // borrowed") the moment an arm below tries `manager.borrow()`
+            // -- confirmed live, not hypothetical: this only ever
+            // triggers once a tab is actually woken from the compressed
+            // or swapped tier via a real click, which no earlier test or
+            // live run happened to exercise.
+            let result = manager.borrow_mut().activate(id);
+            match result {
+                tabs::WakeResult::AlreadyActive
+                | tabs::WakeResult::WokeFromCompressed
+                | tabs::WakeResult::WokeFromSwap => {
                     refresh(&window, &manager.borrow(), active_id.get());
+                    persist_session(&session_store, &manager, active_id.get());
                 }
                 tabs::WakeResult::NeedsRefetch => {
                     let url = manager.borrow().tab(id).map(|t| t.url.clone()).unwrap_or_default();
-                    start_load(id, net::NavIntent::Wake(url), &network, &manager, &window);
+                    start_load(id, net::NavIntent::Wake(url), &network, &manager, &window, &session_store);
                 }
             }
         });
@@ -252,10 +353,11 @@ fn main() {
         let manager = manager.clone();
         let active_id = active_id.clone();
         let network = network.clone();
+        let session_store = session_store.clone();
         window.on_navigate(move |text| {
             let window = window_weak.unwrap();
             if let Some(id) = active_id.get() {
-                start_load(id, net::NavIntent::Navigate(text.to_string()), &network, &manager, &window);
+                start_load(id, net::NavIntent::Navigate(text.to_string()), &network, &manager, &window, &session_store);
             }
         });
     }
@@ -265,11 +367,12 @@ fn main() {
         let manager = manager.clone();
         let active_id = active_id.clone();
         let network = network.clone();
+        let session_store = session_store.clone();
         window.on_reload(move || {
             let window = window_weak.unwrap();
             if let Some(id) = active_id.get() {
                 let url = manager.borrow().tab(id).map(|t| t.url.clone()).unwrap_or_default();
-                start_load(id, net::NavIntent::Reload(url), &network, &manager, &window);
+                start_load(id, net::NavIntent::Reload(url), &network, &manager, &window, &session_store);
             }
         });
     }
@@ -279,11 +382,12 @@ fn main() {
         let manager = manager.clone();
         let active_id = active_id.clone();
         let network = network.clone();
+        let session_store = session_store.clone();
         window.on_go_back(move || {
             let window = window_weak.unwrap();
             if let Some(id) = active_id.get() {
                 if let Some(target) = manager.borrow().peek_back_url(id) {
-                    start_load(id, net::NavIntent::Back(target), &network, &manager, &window);
+                    start_load(id, net::NavIntent::Back(target), &network, &manager, &window, &session_store);
                 }
             }
         });
@@ -294,11 +398,12 @@ fn main() {
         let manager = manager.clone();
         let active_id = active_id.clone();
         let network = network.clone();
+        let session_store = session_store.clone();
         window.on_go_forward(move || {
             let window = window_weak.unwrap();
             if let Some(id) = active_id.get() {
                 if let Some(target) = manager.borrow().peek_forward_url(id) {
-                    start_load(id, net::NavIntent::Forward(target), &network, &manager, &window);
+                    start_load(id, net::NavIntent::Forward(target), &network, &manager, &window, &session_store);
                 }
             }
         });
@@ -326,6 +431,7 @@ fn main() {
         let manager = manager.clone();
         let active_id = active_id.clone();
         let network = network.clone();
+        let session_store = session_store.clone();
         window.on_click(move |x, y, area_width, area_height| {
             let window = window_weak.unwrap();
             let Some(id) = active_id.get() else { return };
@@ -336,7 +442,7 @@ fn main() {
 
             let href = manager.borrow().tab(id).and_then(|t| t.hit_test_href(x * scale_x, y * scale_y));
             if let Some(href) = href {
-                start_load(id, net::NavIntent::Navigate(href), &network, &manager, &window);
+                start_load(id, net::NavIntent::Navigate(href), &network, &manager, &window, &session_store);
             }
         });
     }
