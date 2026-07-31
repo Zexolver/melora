@@ -117,11 +117,44 @@ jobs:
       - name: Install cargo-apk
         run: cargo install cargo-apk
 
-      # Debug-signed (cargo-apk auto-generates a debug keystore) rather
-      # than a Play Store release build -- this is for installing on a
-      # device to try it, not distribution. Release signing needs a real
-      # keystore managed as a secret; add `[package.metadata.android.signing.release]`
-      # and wire that up here if/when actual distribution is needed.
+      # A real bug that failed this job on every past release: the NDK
+      # (r23+, including the r27c pinned above) stopped shipping
+      # target-prefixed binutils (`aarch64-linux-android-ranlib`,
+      # `-ar`, `-strip`, ...) in favor of unprefixed `llvm-ranlib` etc.
+      # Rust's own build (via the `AR_aarch64-linux-android`/
+      # `CC_aarch64-linux-android` env vars cargo-apk sets) doesn't need
+      # the old names, but blitz-net's vendored OpenSSL build
+      # (`openssl-sys` with the `vendored` feature, needed since Android
+      # has no system OpenSSL -- see Cargo.toml) shells out to its own
+      # Configure/Makefile machinery, which still looks for
+      # `${CROSS_COMPILE}ranlib` on `$PATH` the old autotools way and
+      # fails with `aarch64-linux-android-ranlib: not found` /
+      # `make: *** [Makefile:2796: install_dev] Error 127` without it.
+      # Confirmed by reproducing this exact failure in a container
+      # matching this job's toolchain (a bare `ubuntu-latest`-like image
+      # lacks these symlinks the same way, since the NDK genuinely
+      # doesn't provide them) and confirming the fix below resolves it.
+      - name: Fix NDK toolchain PATH for openssl-src
+        run: |
+          mkdir -p "$HOME/ndk-shims"
+          for tool in ar ranlib strip nm readelf objcopy objdump; do
+            ln -sf "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-$tool" \
+              "$HOME/ndk-shims/aarch64-linux-android-$tool"
+          done
+          echo "$HOME/ndk-shims" >> "$GITHUB_PATH"
+          echo "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      # Debug-signed, using the project's own committed
+      # `android/debug.keystore` (see Cargo.toml's
+      # `[package.metadata.android.signing.dev]` and ARCHITECTURE.md's
+      # Android section) rather than cargo-apk's auto-generated one --
+      # this is for installing on a device to try it, not a Play Store
+      # release build, but it's the SAME key on every run, which is what
+      # makes each release installable as an update over the last one
+      # instead of needing an uninstall first. Release signing needs a
+      # real keystore managed as a secret; add
+      # `[package.metadata.android.signing.release]` and wire that up
+      # here if/when actual Play Store distribution is needed.
       - name: Build APK
         run: cargo apk build --target aarch64-linux-android --lib
 
