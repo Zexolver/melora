@@ -6,6 +6,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Lets a run be kicked off by hand (or by an API call) against an
+  # existing release -- e.g. after fixing a bug in this workflow itself,
+  # without needing to cut a whole new tag just to re-trigger it.
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to attach the built artifacts to"
+        required: true
+        default: "v0.1.1"
 
 permissions:
   contents: write
@@ -89,7 +98,20 @@ jobs:
           unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
           mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
           rm /tmp/cmdtools.zip
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
+          # Accepting licenses and installing packages in one piped `yes |
+          # sdkmanager ... <package list>` command is a known footgun:
+          # sdkmanager can close stdout mid-install once it's done reading
+          # license prompts, which SIGPIPEs `yes` and can silently cut the
+          # package list short -- confirmed live, not hypothetical: a run
+          # of this workflow failed with "Platform 30 is not installed"
+          # even though it was in the list, because the log showed `yes:
+          # standard output: Broken pipe` right after the previous package
+          # finished unzipping. Splitting license acceptance (still piped,
+          # since only that step prompts) from the actual package install
+          # (no prompts left, so no pipe needed, so nothing can race)
+          # removes the failure mode entirely rather than papering over it.
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
             "platforms;android-34" "platforms;android-30" "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" "platform-tools"
 
       - name: Install cargo-apk
@@ -125,5 +147,9 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          # On a real tag push, github.ref_name is already the tag; the
+          # workflow_dispatch input only matters (and is only set) when
+          # this was triggered by hand against an existing release.
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: dist/*
           generate_release_notes: true
