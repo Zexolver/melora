@@ -110,16 +110,20 @@ This is an early scaffold, not a daily driver yet. What works today:
   live: a page whose script sets `document.title = "Changed by JS"` shows
   that title in the real tab strip, not just in a unit test. See
   ARCHITECTURE.md for the exact scope and why it's drawn there.
-- **Builds for Android** (`aarch64-linux-android`) with no UI code
-  changes -- verified end to end: a real signed, installable `.apk` was
-  built from this codebase using `cargo-apk`, and the underlying Rust
-  code both checks and links cleanly for the target. Two real blockers
-  were found and fixed along the way (native-tls has no OpenSSL to link
-  against on Android; a JDK 21 + Android build-tools 34 combination hits
-  a known Slint bug in its dexer step) -- see ARCHITECTURE.md for both,
-  and for what's still unverified (no on-device/emulator test yet, and
-  the APK is debug-signed for sideloading, not release-signed for the
-  Play Store).
+- **Builds for, and runs on, Android** (`aarch64-linux-android`) with no
+  UI code changes -- verified end to end, including on a real running
+  emulator: a signed `.apk` installs, launches, renders the real chrome,
+  fetches real pages over the network, and its tabs survive a real app
+  restart (the same session-restore prompt desktop gets). Several real
+  bugs were found and fixed along the way -- native-tls has no OpenSSL to
+  link against on Android; a JDK 21 + Android build-tools 34 combination
+  hits a known Slint bug in its dexer step; a launch-time crash from
+  Android having no writable temp dir the way desktop does; and
+  `Cargo.toml`'s declared app label/SDK versions were silently being
+  ignored due to a config-schema mismatch -- see ARCHITECTURE.md for all
+  of them. Still open: the chrome renders partly under the system status
+  bar (cosmetic, needs inset handling), and the APK is debug-signed for
+  sideloading, not release-signed for the Play Store.
 
 All of the above was checked against a real running instance under Xvfb
 (driven with `xdotool`, screenshotted with `xwd`), not just unit-tested —

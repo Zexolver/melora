@@ -31,7 +31,15 @@ pub struct SwapFile {
 
 impl SwapFile {
     pub fn new() -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
+        // `crate::paths::data_dir()`, not `std::env::temp_dir()` -- the
+        // former is a real per-app writable directory on every platform
+        // this browser targets, including Android, where the system temp
+        // dir `temp_dir()` would otherwise resolve to isn't writable by a
+        // regular app (confirmed live: `Permission denied` crashing the
+        // app on launch before this fix).
+        let dir = crate::paths::data_dir().join("swap");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!(
             "melora-swap-{}-{}.bin",
             std::process::id(),
             std::time::SystemTime::now()

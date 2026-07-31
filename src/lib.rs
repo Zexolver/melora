@@ -588,6 +588,14 @@ pub fn run() {
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: slint::android::AndroidApp) {
+    // Captured before `app` is moved into `slint::android::init` below --
+    // this is the only way to get a real writable per-app directory on
+    // Android (the equivalent of `Context.getFilesDir()`, via JNI); see
+    // `paths::data_dir()`, which everything that persists to disk
+    // (session, settings, the swap tier) goes through.
+    if let Some(dir) = app.internal_data_path() {
+        paths::set_android_data_dir(dir);
+    }
     slint::android::init(app).expect("failed to initialize Slint's Android backend");
     run();
 }

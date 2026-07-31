@@ -1,6 +1,6 @@
 [package]
 name = "melora"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -63,11 +63,49 @@ gosub_shared = { git = "https://github.com/gosub-io/gosub-engine" }
 # Read by `cargo apk` (https://github.com/rust-mobile/cargo-apk) to build
 # and sign an APK from the `cdylib` target above -- see
 # .github/workflows/release.yml and ARCHITECTURE.md's Android section.
+#
+# cargo-apk 0.10's config is `#[serde(flatten)]`-ed directly from
+# `ndk_build::manifest::AndroidManifest`, which nests the SDK versions and
+# app label under `sdk`/`application` sub-tables rather than accepting
+# them as flat keys here -- confirmed by extracting cargo-apk's own
+# source: flat `apk_label`/`target_sdk_version`/`min_sdk_version` keys (as
+# this file had before) are simply unknown fields serde silently drops,
+# so the APK was actually shipping with cargo-apk's own defaults
+# (label "melora", minSdk 23, targetSdk whatever `ndk.default_target_platform()`
+# resolves to) instead of what was declared here -- verified via `aapt
+# dump badging` on the built APK before this fix.
 [package.metadata.android]
 package = "org.melora.browser"
-apk_label = "Melora"
-target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Melora"
+
+[package.metadata.android.sdk]
 min_sdk_version = 26
+target_sdk_version = 34
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
+
+# Without this, every build signs with `cargo apk`'s auto-generated
+# `~/.android/debug.keystore` -- fine for one machine's own repeated local
+# builds (the file persists there across runs), but on GitHub Actions'
+# ephemeral runners a *new random* debug key gets generated on every
+# separate CI run, so every past release so far was actually signed with a
+# different key than the one before it. Android refuses to install an
+# update over an existing app when the signing certificate doesn't match
+# (confirmed live: `adb install -r` of a same-key rebuild replaces the app
+# in place; a different-key rebuild fails and needs an uninstall first) --
+# that mismatch, not anything about version numbers, is what forces
+# "uninstall to update." Pointing every build (local and CI) at this one
+# checked-in keystore fixes it for good. This is the "dev"/debug profile
+# specifically (`cargo apk build` with no `--release`, what this project
+# actually ships) -- committing it is the normal, low-stakes thing to do
+# for a debug key: alias/password are Android's own well-known debug
+# defaults (`androiddebugkey`/`android`), not real secrets, and it isn't
+# used for -- or a substitute for -- real Play Store release signing (see
+# ARCHITECTURE.md's Android section and Roadmap for that separate,
+# still-open task).
+[package.metadata.android.signing.dev]
+path = "android/debug.keystore"
+keystore_password = "android"

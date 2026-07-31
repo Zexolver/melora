@@ -172,15 +172,95 @@ release signing (generating a keystore, storing it as a CI secret) is
 future work for whenever actual distribution, not just testing, is the
 goal -- see Roadmap.
 
-**Known gap:** the INTERNET permission is declared
-(`[[package.metadata.android.uses_permission]] name =
-"android.permission.INTERNET"` in Cargo.toml, read by cargo-apk when
-generating the manifest), so networking should work on-device the same
-as desktop, but this hasn't been verified on an actual device or
-emulator in this environment -- only that it builds, links, and packages
-correctly. There's no Android emulator here to boot and click through;
-that verification is next, on a real device or emulator, not simulated
-here.
+**Verified live, on a real running emulator, not just built and
+packaged.** With an `x86_64` Android 15 (API 35) emulator running
+(system image `system-images/android-35/google_apis/x86_64`, arm64
+translation enabled), the debug APK was installed and launched via
+`adb`, and the following was confirmed with real evidence (screenshots
+and `logcat`), not assumed from the build succeeding:
+
+- **The app launched and rendered the real chrome** -- tab strip,
+  address bar, nav buttons, status bar -- pixel-identical in structure to
+  the desktop/Xvfb screenshots elsewhere in this doc.
+- **Real HTTP(S) fetching works on-device.** Typing `example.com` into
+  the address bar and tapping Go fetched and rendered the real
+  `example.com` page over the network, closing the gap this section used
+  to describe as unverified.
+- **Session persistence survives a real app restart on Android**, not
+  just desktop: `adb shell am force-stop` followed by relaunching showed
+  the real "1 tab(s) from your last session are still residing. Restore
+  them?" prompt, and the on-disk session file was confirmed at
+  `/data/data/org.melora.browser/files/session.bin` via `adb shell
+  run-as`.
+- **A real launch-time crash was found and fixed.** The very first
+  launch attempt aborted immediately (`Fatal signal 6 (SIGABRT)`,
+  `logcat` showing `RustPanic: failed to create melora's swap file: Os {
+  code: 13, kind: PermissionDenied }`). Root cause: `SwapFile::new()`
+  (`src/swap.rs`) and `paths::data_dir()` (`src/paths.rs`) both used
+  `std::env::temp_dir()`/`$HOME`-based resolution that has no equivalent
+  on Android -- the app process gets a near-empty environment, and
+  Android's actual per-app writable directory (`Context.getFilesDir()`)
+  is only reachable via JNI, which is exactly what
+  `android_activity::AndroidApp::internal_data_path()` wraps. Fixed by
+  capturing `app.internal_data_path()` in `android_main` (`src/lib.rs`)
+  *before* `app` is moved into `slint::android::init`, storing it in a
+  `paths::set_android_data_dir` global, and having `paths::data_dir()`
+  prefer that on Android; `swap.rs` now creates its swap file under
+  `paths::data_dir()` instead of the system temp dir. This is also what
+  makes the session-restore prompt above possible on Android at all --
+  `session.rs` and `settings.rs` already routed through `paths::data_dir()`,
+  so fixing it once fixed persistence for all three. Confirmed fixed by
+  re-running the exact steps that crashed it before the fix and seeing
+  real files land at `/data/data/org.melora.browser/files/{session.bin,
+  swap/*.bin}` instead.
+- **A real packaging bug: `Cargo.toml`'s Android metadata was being
+  silently ignored.** `apk_label`, `target_sdk_version`, and
+  `min_sdk_version` were declared as flat keys under
+  `[package.metadata.android]`, but cargo-apk 0.10's config type
+  (`ndk_build::manifest::AndroidManifest`, flattened into that table)
+  nests SDK versions under `sdk` and the label under `application` --
+  unknown flat keys are silently dropped by serde rather than erroring,
+  so the shipped APK actually had cargo-apk's own defaults (`label`
+  `"melora"`, `minSdkVersion` 23, `targetSdkVersion` whatever
+  `ndk.default_target_platform()` resolved to) instead of what this file
+  claimed. Confirmed both the bug and the fix with `aapt dump badging`
+  on the built APK: before, `minSdkVersion='23' targetSdkVersion='30'
+  application: label='melora'`; after moving the same values into
+  `[package.metadata.android.sdk]` and
+  `[package.metadata.android.application]`, `minSdkVersion='26'
+  targetSdkVersion='34' application: label='Melora'`, and `adb shell
+  dumpsys package org.melora.browser` agrees.
+
+**A real update-installation bug: every release so far could only be
+installed fresh, never updated in place.** `cargo apk build` (no
+`--release`, what this project actually ships) signs with `~/.android/debug.keystore`
+by default -- auto-generated on first use if it doesn't exist. On a
+single developer machine that file persists, so repeated local builds
+share one key; on GitHub Actions' ephemeral runners, a *new random* one
+gets generated on every separate workflow run, so each past tagged
+release was actually signed with a different key than the one before
+it. Android's package installer refuses to install an update over an
+app already on-device when the signing certificate doesn't match --
+confirmed live: `adb install -r` of a same-key rebuild replaced the app
+in place with no complaint, while installing a different-key build over
+an existing install failed outright with `INSTALL_FAILED_UPDATE_INCOMPATIBLE:
+... signatures do not match`, requiring an uninstall first. Fixed by
+generating one project-specific keystore (`android/debug.keystore`,
+using Android's own well-known debug alias/password --
+`androiddebugkey`/`android`, not a real secret) and committing it, wired
+in via `[package.metadata.android.signing.dev]` in `Cargo.toml`. This is
+still the debug/dev signing profile, not real release signing (see
+Roadmap) -- it fixes update stability for the debug-signed sideload
+builds this project actually ships today, nothing more.
+
+**Still-open gap:** the app's own tab strip/address bar render partly
+underneath the system status bar's clock/wifi/battery icons on this
+emulator -- `android_activity`'s `NativeActivity` doesn't handle
+display-cutout/system-bar insets on its own, and nothing here has told
+it to yet. Cosmetic, not a crash, and not investigated further this
+round; a real fix needs either a custom `android:theme` (cargo-apk
+supports pointing `resources` at a `res/` directory with a `styles.xml`)
+or handling `WindowInsets` explicitly.
 
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 
@@ -712,6 +792,9 @@ below, which is where actual, intentional ad-blocking would have to live.
   exit; a real free-list is future work if it ever matters in practice.
 - **No extension system of any kind.** No content-blocking, no
   WebExtensions compatibility, nothing. See Roadmap.
+- **Android's chrome renders under the system status bar.** See the
+  Android section above -- cosmetic, needs either a custom `android:theme`
+  or explicit `WindowInsets` handling; not investigated yet.
 
 ## Roadmap (rough order)
 
