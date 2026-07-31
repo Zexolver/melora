@@ -48,7 +48,37 @@ impl PageEngine {
         config.viewport = Some(Viewport::new(viewport.0, viewport.1, 1.0, ColorScheme::Light));
         config.base_url = Some(url.to_string());
         config.net_provider = net_provider;
-        let mut document = HtmlDocument::from_html(html, config);
+        // `HtmlDocument::from_html` isn't just an HTML5 parse -- html5ever's
+        // tree builder eagerly loads `<link rel="stylesheet">`s as it
+        // encounters them (`DocumentMutator::load_linked_stylesheet`,
+        // called synchronously from `flush_eager_ops`), which can hit the
+        // exact same blitz-dom `resolve_url` panic guarded against in
+        // `apply_resource` below (a fetched stylesheet's own relative
+        // reference can't resolve against a `data:` base) -- except here
+        // it happens on the very first parse, not a later async resource
+        // application, so `apply_resource`'s guard never runs for it.
+        // Verified live on duckduckgo.com: unguarded, this panic reached
+        // `android_activity`'s own `abort_on_panic` boundary and closed
+        // the Activity outright (visible to the user as the app exiting
+        // to the home screen) even though the process itself survived --
+        // catching it here, before it can unwind that far, is what
+        // actually stops that. Falls back to a local error page (no
+        // `net_provider`, so it can't recurse into the same bug) rather
+        // than a half-built document, since a panic mid-parse leaves
+        // nothing valid to keep using.
+        let mut document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            HtmlDocument::from_html(html, config)
+        }))
+        .unwrap_or_else(|_| {
+            let mut fallback_config = DocumentConfig::default();
+            fallback_config.viewport = Some(Viewport::new(viewport.0, viewport.1, 1.0, ColorScheme::Light));
+            fallback_config.base_url = Some(url.to_string());
+            HtmlDocument::from_html(
+                "<html><body><h1>This page couldn't be displayed</h1>\
+                 <p>An internal rendering error occurred while loading this page.</p></body></html>",
+                fallback_config,
+            )
+        });
         // blitz-dom's layout code is young enough to have real bugs on real
         // pages (see the doc comment on `resolve_layout_safely`) -- caught
         // here rather than letting one bad page take the whole app down.

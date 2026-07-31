@@ -295,6 +295,33 @@ release (not simulated) and fixed for v0.1.3:**
   proven live to work; obscure BMP symbol blocks have proven live not
   to.
 
+**The v0.1.3 fix above was real but incomplete -- duckduckgo.com still
+took the app down after it shipped, fixed properly for v0.1.4.** The
+`apply_resource` guard only covers a *later*, async resource-application
+path; a full `RUST_BACKTRACE=full` capture (temporarily added to
+`android_main`, then removed) proved this exact page hits the same
+underlying `blitz-dom` `resolve_url` panic through a completely
+different, earlier call path: `PageEngine::from_html` ->
+`HtmlDocument::from_html` -> html5ever's tree builder eagerly loading a
+`<link rel="stylesheet">` *during the initial parse itself*
+(`DocumentMutator::load_linked_stylesheet`, called synchronously from
+`flush_eager_ops`) -- before the page has a document to apply async
+resources to at all, so `apply_resource`'s guard never runs. Unguarded,
+this reached `android-activity`'s own `abort_on_panic` boundary (visible
+in the backtrace at frame 80) and closed the Activity outright -- the
+user saw the app silently exit to the home screen, worse than a crash
+in some ways since nothing indicated what happened, even though the
+underlying process technically survived (same PID, no `FATAL SIGABRT`).
+Fixed by wrapping `HtmlDocument::from_html` itself in `catch_unwind`,
+falling back to a local "This page couldn't be displayed" document
+(built with no `net_provider`, so the fallback itself can't recurse
+into the same bug) rather than a half-parsed one, since a panic
+mid-parse leaves nothing valid to keep using. Verified live on the
+exact repro: the panic still logs once (the third-party bug is
+unchanged), but the Activity stays open and visible, the process
+survives, and the tab shows the fallback message instead of the app
+disappearing.
+
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 
 `TabManager` keeps an LRU order over open tabs and a fixed budget
