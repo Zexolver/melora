@@ -262,6 +262,39 @@ round; a real fix needs either a custom `android:theme` (cargo-apk
 supports pointing `resources` at a `res/` directory with a `styles.xml`)
 or handling `WindowInsets` explicitly.
 
+**Two more real bugs, found from actual on-device use of the v0.1.2
+release (not simulated) and fixed for v0.1.3:**
+
+- **A real page (duckduckgo.com) crashed the app.** `blitz-dom` panics
+  when a fetched stylesheet's content references a relative URL (here,
+  `/_next/static/css/....css`) but the resource's own identity is a
+  `data:` URL, which can't serve as a base for relative resolution --
+  the same class of third-party-engine bug as the pypi.org table-layout
+  panic documented above. Unlike that one, this specific call --
+  `PageEngine::apply_resource`'s call into `document.load_resource` --
+  wasn't wrapped in the `catch_unwind` guard `resolve()`/`paint()`
+  already have, so it wasn't contained. Fixed in `src/engine.rs` by
+  guarding it the same way. Verified live: the panic still logs (the
+  underlying blitz-dom bug is unchanged), but the process no longer
+  dies -- same PID before and after, no `FATAL SIGABRT`, and session
+  save/restore kept working normally afterward, which a real crash
+  would have prevented.
+- **Several toolbar icons rendered as tofu boxes on a real device.**
+  `ui/melora.slint` used BMP dingbat/arrow-block glyphs (⟳ U+27F3 for
+  reload, ✕ U+2715 for closing a tab) that Android's font stack doesn't
+  cover in this rendering path, unlike desktop Linux with Noto fonts
+  installed. Tried several same-block alternatives (U+21BB, U+21BA,
+  U+27F2, U+2B6E, U+2B6F) live, side by side in one build -- all tofu.
+  What actually renders: a full emoji (🔄 U+1F504, supplementary plane,
+  routes through Android's system emoji font) for reload; for the tab
+  close button specifically, U+00D7 (×, Latin-1 Supplement -- a
+  different block from the ones that failed) rather than an emoji,
+  since that button's color changes on hover and a colored emoji
+  ignores the `color:` property entirely. General lesson for any future
+  icon glyph on this platform: full emoji or Latin-1-range symbols have
+  proven live to work; obscure BMP symbol blocks have proven live not
+  to.
+
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 
 `TabManager` keeps an LRU order over open tabs and a fixed budget

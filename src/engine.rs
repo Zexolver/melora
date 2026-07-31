@@ -89,13 +89,31 @@ impl PageEngine {
     }
 
     /// Applies a fetched sub-resource (stylesheet, image, font) and
-    /// re-resolves style/layout to reflect it. Returns `false` if that
-    /// re-resolve hit an internal layout panic (contained, not propagated
-    /// -- see `resolve_layout_safely`); the page is left showing whatever
-    /// it looked like before this resource, rather than crashing.
+    /// re-resolves style/layout to reflect it. Returns `false` if either
+    /// step hit an internal panic (contained, not propagated -- see
+    /// `resolve_layout_safely`); the page is left showing whatever it
+    /// looked like before this resource, rather than crashing.
+    ///
+    /// `load_resource` itself needs the same `catch_unwind` guard as
+    /// `resolve()`/`paint()` below, not just the re-resolve after it: a
+    /// real page (duckduckgo.com) crashed the whole app -- verified live,
+    /// including a full process abort on Android, not just a caught
+    /// error -- because `document.load_resource` calls into blitz-dom's
+    /// `resolve_url`, which `panic!`s outright when a fetched
+    /// stylesheet's content references a relative URL (here,
+    /// `/_next/static/css/....css`) but the resource's own base URL is a
+    /// `data:` URL, which is inherently "cannot be a base" and has no
+    /// relative resolution to fall back to. A third-party parsing bug
+    /// reachable from real markup shouldn't take the whole browser down
+    /// any more than the table-layout panic documented on `resolve()`
+    /// does.
     pub fn apply_resource(&mut self, resource: Resource) -> bool {
-        self.document.load_resource(resource);
-        self.resolve_layout_safely()
+        let document = &mut self.document;
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.load_resource(resource);
+        }))
+        .is_ok();
+        loaded && self.resolve_layout_safely()
     }
 
     /// Rasterizes the current (already-scrolled, already-laid-out) view of

@@ -58,7 +58,17 @@ component TabButton inherits Rectangle {
                 width: 16px;
                 clicked => { root.close(); }
                 Text {
-                    text: "\u{2715}";
+                    // Was U+2715 (✕, Dingbats) -- tofu on Android, same
+                    // font-coverage gap as the reload icon above. Unlike
+                    // reload, this needs to stay a plain (non-emoji)
+                    // glyph so `color:` below keeps working -- a colored
+                    // emoji ignores text color entirely, which would
+                    // fight the muted/hover styling here. U+00D7
+                    // (multiplication sign, Latin-1 Supplement) is a
+                    // different block from the arrows/dingbats that
+                    // failed and virtually always covered; confirmed
+                    // live.
+                    text: "\u{00D7}";
                     color: closeArea.has-hover ? Theme.text : Theme.text-muted;
                     font-size: 10px;
                     vertical-alignment: center;
@@ -171,7 +181,20 @@ export component MainWindow inherits Window {
 
                 Button { text: "<"; enabled: root.can-go-back; clicked => { root.go-back(); } }
                 Button { text: ">"; enabled: root.can-go-forward; clicked => { root.go-forward(); } }
-                Button { text: "\u{27F3}"; clicked => { root.reload(); } }
+                // Was U+27F3 (⟳); also tried U+21BB, U+21BA, U+27F2,
+                // U+2B6E, U+2B6F -- all rendered as tofu boxes on a real
+                // Android device/emulator. Confirmed live, by rendering
+                // 8 candidates side by side in one build, that the
+                // pattern isn't which glyph looks right, it's plane: the
+                // BMP "dingbat"/arrow-block symbols above all lack
+                // fallback coverage in whatever font Slint's software
+                // renderer resolves on Android, while a full emoji
+                // (U+1F504, supplementary plane) rendered correctly --
+                // real color and all -- because it routes through
+                // Android's system emoji font instead. Plain ASCII 'R'
+                // also worked, as a fallback data point, but the emoji
+                // reads as an actual icon.
+                IconButton { icon: "\u{1F504}"; clicked => { root.reload(); } }
 
                 Rectangle {
                     horizontal-stretch: 1;
