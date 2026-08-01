@@ -101,13 +101,18 @@ impl Tab {
         self.engine.as_ref().map(PageEngine::doc_id)
     }
 
-    /// Applies a fetched sub-resource; a no-op if this tab has no live
-    /// engine (e.g. it was demoted between the fetch starting and
-    /// finishing).
-    pub fn apply_resource(&mut self, resource: Resource) {
-        if let Some(engine) = self.engine.as_mut() {
-            engine.apply_resource(resource);
-        }
+    /// Loads a fetched sub-resource without re-resolving layout -- see
+    /// `TabManager::load_resource`/`resolve_layout_for_doc` for why a
+    /// caller applying a whole batch of resources to this tab in one go
+    /// wants that as a separate, single step rather than paying for a
+    /// full layout pass per resource.
+    pub fn load_resource(&mut self, resource: Resource) -> bool {
+        self.engine.as_mut().is_some_and(|engine| engine.load_resource(resource))
+    }
+
+    /// Just the layout-resolve half -- see `load_resource` above.
+    pub fn resolve_layout(&mut self) -> bool {
+        self.engine.as_mut().is_some_and(|engine| engine.resolve_layout())
     }
 
     /// If `(x, y)` lands on a link, the URL it resolves to. `None` if
@@ -366,13 +371,31 @@ impl TabManager {
     /// Routes a fetched sub-resource to whichever tab's document it
     /// belongs to (matched by doc id, since resources arrive asynchronously
     /// and the tab may since have navigated away, been closed, or been
-    /// demoted). Returns `true` if a live tab was found and updated.
-    pub fn apply_resource(&mut self, doc_id: usize, resource: Resource) -> bool {
+    /// demoted), loading it without a layout re-resolve. Returns `true` if
+    /// a live tab was found and updated. Pairs with `resolve_layout_for_doc`
+    /// below, meant to be called once after every resource in a batch
+    /// destined for the same document has been loaded, rather than once
+    /// per resource. `lib.rs`'s network-draining timer is the real caller:
+    /// it can receive several resources for the same page in one 50ms tick
+    /// (a real page with several stylesheets, like duckduckgo.com's 8, all
+    /// arriving close together), and resolving layout after each one
+    /// individually means doing a full synchronous layout pass on Slint's
+    /// UI thread once per resource instead of once per batch -- confirmed
+    /// live to be slow enough to trip Android's ANR watchdog.
+    pub fn load_resource(&mut self, doc_id: usize, resource: Resource) -> bool {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.doc_id() == Some(doc_id)) else {
             return false;
         };
-        tab.apply_resource(resource);
+        tab.load_resource(resource);
         true
+    }
+
+    /// The other half of `load_resource` above.
+    pub fn resolve_layout_for_doc(&mut self, doc_id: usize) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.doc_id() == Some(doc_id)) else {
+            return false;
+        };
+        tab.resolve_layout()
     }
 
     /// Re-lays-out every currently-active tab for a new viewport size
@@ -728,14 +751,26 @@ mod tests {
         assert_eq!(mgr.tab(b).unwrap().paint().unwrap().len(), 400 * 300 * 4);
     }
 
+    /// `load_resource` routes a fetched sub-resource to whichever tab's
+    /// document it belongs to (matched by doc id, since resources arrive
+    /// asynchronously and the tab may since have navigated away, been
+    /// closed, or been demoted); `resolve_layout_for_doc` is the paired
+    /// layout re-resolve, meant to be called once after a whole batch of
+    /// `load_resource` calls for the same document rather than once per
+    /// resource -- see their doc comments for the real ANR on
+    /// duckduckgo.com this split fixed. Both return `false` for a stale
+    /// doc id, `true` once a live tab is found and updated.
     #[test]
-    fn apply_resource_routes_to_the_matching_tab_by_doc_id_and_ignores_stale_ids() {
+    fn load_resource_and_resolve_layout_for_doc_route_by_doc_id_and_ignore_stale_ids() {
         let mut mgr = TabManager::new(4, (800, 600));
         let a = mgr.open_tab("a", DEMO);
         let doc_id = mgr.tab(a).unwrap().doc_id().unwrap();
 
-        assert!(!mgr.apply_resource(doc_id + 12345, Resource::None));
-        assert!(mgr.apply_resource(doc_id, Resource::None));
+        assert!(!mgr.load_resource(doc_id + 12345, Resource::None));
+        assert!(!mgr.resolve_layout_for_doc(doc_id + 12345));
+
+        assert!(mgr.load_resource(doc_id, Resource::None));
+        assert!(mgr.resolve_layout_for_doc(doc_id));
     }
 
     #[test]

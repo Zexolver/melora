@@ -373,6 +373,45 @@ clunky/not modern".** Three concrete, live-verified changes:
   a single button, the same fix real mobile browsers make for the same
   reason.
 
+**v0.1.5 made duckduckgo.com render real content, but real use turned
+up two more issues: a real ANR (fixed for v0.1.6), and a CSS/layout
+gap that isn't.**
+
+- **A real ANR ("melora isn't responding"), fixed.** `lib.rs`'s
+  network-draining timer resolved layout (`PageEngine::apply_resource`,
+  a full `document.resolve()` pass) once per resource as it was
+  applied. Fine for a page with one stylesheet; not fine for
+  duckduckgo.com, which serves 8 separate CSS files that typically all
+  arrive within the same 50ms timer tick -- confirmed live, all 8
+  `Fetching`/`Success` log lines land within about 10ms of each other.
+  That meant 8 synchronous full-page layout passes back to back on
+  Slint's single UI thread with no yield in between, which was slow
+  enough to trip Android's ANR watchdog. Fixed by splitting
+  `apply_resource` into `load_resource` (just the fetch-result
+  application, cheap) and `resolve_layout` (the expensive part), with
+  `TabManager::load_resource`/`resolve_layout_for_doc` and `lib.rs`'s
+  timer now loading every resource pending in a tick first and
+  resolving layout once per *document* touched, not once per
+  *resource*. Verified live: the same duckduckgo.com load that used to
+  ANR now completes with no ANR and no dropped frames, confirmed via a
+  fresh capture of the same 8-file fetch sequence.
+- **The page still renders visibly under-styled -- no search-box
+  border, elements not where they should be -- and this is not fixed,
+  because it isn't a bug with an obvious fix.** All 8 CSS files fetch
+  and apply with zero errors -- this was checked directly, not assumed.
+  The gap is in how much of real, modern CSS `blitz-dom`'s style/layout
+  stack (Stylo for cascading, Taffy for layout, both still young per
+  the "Chosen stack" section above) actually implements: one of
+  duckduckgo.com's 8 stylesheets alone uses CSS custom properties
+  (`var(--...)`) 686 times against 1,251 declarations of them --
+  extremely heavy reliance on a CSS feature whose *cascading and
+  computed-value resolution* is nontrivial to get fully right, on top
+  of whatever combination of flexbox/grid actually positions the
+  search box. This is a real engine-capability gap, not a quick patch
+  -- fixing it properly means improving Stylo/Taffy's own CSS
+  conformance, not something to fake with page-specific workarounds in
+  Melora's own code.
+
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 
 `TabManager` keeps an LRU order over open tabs and a fixed budget
@@ -689,10 +728,12 @@ for top-level page fetches) and shares it across every tab via
 `TabManager::set_resource_provider`. Results come back on the same
 background thread as page fetches, through a second channel
 (`NetworkEvents::resources`), and are applied the same way: drained on the
-UI thread by `main.rs`'s existing timer, routed to the right tab by
+UI thread by `lib.rs`'s existing timer, routed to the right tab by
 matching `Resource`'s tagged doc id against each tab's `PageEngine::doc_id`
-(`TabManager::apply_resource`), then `PageEngine::apply_resource` calls
-`BaseDocument::load_resource` and re-resolves style + layout.
+(`TabManager::load_resource`), which calls `BaseDocument::load_resource`;
+layout is then re-resolved once per document touched in that tick
+(`TabManager::resolve_layout_for_doc`), not once per resource -- see the
+v0.1.6 section below for why that split exists.
 
 Proven two ways: a hermetic test (`resource_provider_delivers_a_fetched_stylesheet_to_the_right_doc`
 in `src/net.rs`, plus an equivalent in `src/engine.rs`) that fetches a
@@ -767,8 +808,9 @@ projects" premise this whole repo is built on -- not swept under the rug.
 
 What matters for a daily driver is that one page's rendering bug can't
 take the whole browser down. `PageEngine` now wraps every call into
-`blitz-dom`'s layout resolution (`from_html`, `apply_resource`, `resize`)
-and into painting (`paint`) in `std::panic::catch_unwind`
+`blitz-dom`'s layout resolution (`from_html`, `load_resource`,
+`resolve_layout`, `resize`) and into painting (`paint`) in
+`std::panic::catch_unwind`
 (`resolve_layout_safely` in `src/engine.rs`), converting a would-be crash
 into "this operation didn't fully succeed" (`false`/`None`) instead of an
 unwind that reaches `main`. The page may end up showing stale or
@@ -820,7 +862,7 @@ shared `JsEngine`** -- so `<script>var x = 1;</script>...<script>x++;</script>`
 sees the same global scope, matching how real browsers run multiple
 `<script>` blocks on one page. This happens exactly once, right after the
 initial layout resolve; scripts are *not* re-run when a sub-resource
-arrives later (`apply_resource`), since re-running on every stylesheet/
+arrives later (`load_resource`), since re-running on every stylesheet/
 image load would mean duplicate console spam and the title getting reset
 over and over for no reason.
 
@@ -903,9 +945,11 @@ below, which is where actual, intentional ad-blocking would have to live.
   exit; a real free-list is future work if it ever matters in practice.
 - **No extension system of any kind.** No content-blocking, no
   WebExtensions compatibility, nothing. See Roadmap.
-- **Android's chrome renders under the system status bar.** See the
-  Android section above -- cosmetic, needs either a custom `android:theme`
-  or explicit `WindowInsets` handling; not investigated yet.
+- **CSS conformance is incomplete for real, modern pages.** See the
+  Android section's duckduckgo.com writeup above -- fetching and
+  applying a page's real CSS isn't the gap, Stylo/Taffy actually
+  implementing enough of it (heavy `var(--...)` custom-property usage
+  especially) to lay a complex real page out correctly is.
 
 ## Roadmap (rough order)
 

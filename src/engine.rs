@@ -53,10 +53,10 @@ impl PageEngine {
         // encounters them (`DocumentMutator::load_linked_stylesheet`,
         // called synchronously from `flush_eager_ops`), which can hit the
         // exact same blitz-dom `resolve_url` panic guarded against in
-        // `apply_resource` below (a fetched stylesheet's own relative
+        // `load_resource` below (a fetched stylesheet's own relative
         // reference can't resolve against a `data:` base) -- except here
         // it happens on the very first parse, not a later async resource
-        // application, so `apply_resource`'s guard never runs for it.
+        // application, so `load_resource`'s guard never runs for it.
         // Verified live on duckduckgo.com: unguarded, this panic reached
         // `android_activity`'s own `abort_on_panic` boundary and closed
         // the Activity outright (visible to the user as the app exiting
@@ -113,23 +113,25 @@ impl PageEngine {
 
     /// This document's id, used to route an incoming `Resource` (fetched
     /// asynchronously, arriving later) back to the right tab -- see
-    /// `TabManager::apply_resource`.
+    /// `TabManager::load_resource`/`resolve_layout_for_doc`.
     pub fn doc_id(&self) -> usize {
         self.document.id()
     }
 
-    /// Applies a fetched sub-resource (stylesheet, image, font) and
-    /// re-resolves style/layout to reflect it. Returns `false` if either
-    /// step hit an internal panic (contained, not propagated -- see
-    /// `resolve_layout_safely`); the page is left showing whatever it
-    /// looked like before this resource, rather than crashing.
+    /// Loads a fetched sub-resource (stylesheet, image, font) without
+    /// re-resolving style/layout -- see `resolve_layout` below for why a
+    /// caller applying several resources to the same document in one batch
+    /// (`TabManager::load_resource` / `TabManager::resolve_layout_for_doc`,
+    /// driven from `lib.rs`'s timer loop) wants these as two separate steps
+    /// rather than one combined call per resource. Returns `false` if it
+    /// hit an internal panic (contained, not propagated -- see
+    /// `resolve_layout_safely`).
     ///
-    /// `load_resource` itself needs the same `catch_unwind` guard as
-    /// `resolve()`/`paint()` below, not just the re-resolve after it: a
-    /// real page (duckduckgo.com) crashed the whole app -- verified live,
-    /// including a full process abort on Android, not just a caught
-    /// error -- because `document.load_resource` calls into blitz-dom's
-    /// `resolve_url`, which `panic!`s outright when a fetched
+    /// This needs the same `catch_unwind` guard as `resolve()`/`paint()`
+    /// below: a real page (duckduckgo.com) crashed the whole app --
+    /// verified live, including a full process abort on Android, not just
+    /// a caught error -- because `document.load_resource` calls into
+    /// blitz-dom's `resolve_url`, which `panic!`s outright when a fetched
     /// stylesheet's content references a relative URL (here,
     /// `/_next/static/css/....css`) but the resource's own base URL is a
     /// `data:` URL, which is inherently "cannot be a base" and has no
@@ -137,13 +139,26 @@ impl PageEngine {
     /// reachable from real markup shouldn't take the whole browser down
     /// any more than the table-layout panic documented on `resolve()`
     /// does.
-    pub fn apply_resource(&mut self, resource: Resource) -> bool {
+    pub fn load_resource(&mut self, resource: Resource) -> bool {
         let document = &mut self.document;
-        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             document.load_resource(resource);
         }))
-        .is_ok();
-        loaded && self.resolve_layout_safely()
+        .is_ok()
+    }
+
+    /// The layout-resolve half of applying a fetched resource -- kept
+    /// separate from `load_resource` above so a batch of `load_resource`
+    /// calls (e.g. several stylesheets that all arrived in the same tick)
+    /// can share a single resolve instead of paying for one full layout
+    /// pass per resource. A real, non-hypothetical problem this fixes:
+    /// duckduckgo.com's real page loads 8 separate CSS files, and doing 8
+    /// synchronous full-page `document.resolve()` passes back to back on
+    /// Slint's single UI thread -- resolving after every individual
+    /// `load_resource` call -- was long enough to trip Android's ANR
+    /// watchdog ("melora isn't responding"), confirmed live.
+    pub fn resolve_layout(&mut self) -> bool {
+        self.resolve_layout_safely()
     }
 
     /// Rasterizes the current (already-scrolled, already-laid-out) view of
@@ -388,11 +403,11 @@ mod tests {
 
     /// Exercises the real sub-resource pipeline end to end: a stylesheet
     /// fetched over the network (a `file://` URL here, so the test is
-    /// hermetic) is applied via `apply_resource` and actually changes what
-    /// gets painted -- the same path `main.rs` drives for real HTTP(S)
-    /// stylesheets, images, and fonts.
+    /// hermetic) is applied via `load_resource` + `resolve_layout` and
+    /// actually changes what gets painted -- the same path `lib.rs` drives
+    /// for real HTTP(S) stylesheets, images, and fonts.
     #[test]
-    fn apply_resource_applies_a_fetched_stylesheet() {
+    fn load_resource_and_resolve_layout_apply_a_fetched_stylesheet() {
         let dir = std::env::temp_dir().join(format!(
             "melora-engine-subres-test-{}-{}",
             std::process::id(),
@@ -436,7 +451,8 @@ mod tests {
         assert_ne!(&before[..4], &[9, 9, 9, 255], "sanity check: shouldn't be pre-styled");
 
         let (_doc_id, resource) = rx.recv_timeout(Duration::from_secs(5)).expect("no resource event received");
-        assert!(engine.apply_resource(resource));
+        assert!(engine.load_resource(resource));
+        assert!(engine.resolve_layout());
 
         let after = engine.paint().unwrap();
         assert_eq!(&after[..4], &[9, 9, 9, 255], "external stylesheet's background-color was not applied");

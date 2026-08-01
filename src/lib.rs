@@ -268,8 +268,25 @@ pub fn run() {
                     intent.apply(&mut mgr, id, &html);
                     applied = true;
                 }
+                // Loads every resource pending in this tick first, then
+                // resolves layout once per document actually touched --
+                // not once per resource. A real page can hand back
+                // several resources in the same 50ms tick (duckduckgo.com
+                // loads 8 separate stylesheets), and resolving after each
+                // one individually means doing a full synchronous layout
+                // pass on this UI thread per resource instead of per
+                // batch. Confirmed live: with the old one-resolve-per-
+                // resource behavior, that was slow enough to trip
+                // Android's ANR watchdog navigating to duckduckgo.com --
+                // see `PageEngine::resolve_layout`'s doc comment.
+                let mut touched_docs: Vec<usize> = Vec::new();
                 while let Ok((doc_id, resource)) = net_events.resources.try_recv() {
-                    if manager.borrow_mut().apply_resource(doc_id, resource) {
+                    if manager.borrow_mut().load_resource(doc_id, resource) && !touched_docs.contains(&doc_id) {
+                        touched_docs.push(doc_id);
+                    }
+                }
+                for doc_id in touched_docs {
+                    if manager.borrow_mut().resolve_layout_for_doc(doc_id) {
                         applied = true;
                     }
                 }

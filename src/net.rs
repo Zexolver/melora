@@ -81,7 +81,7 @@ pub struct NetworkEvents {
     /// triggered internally by blitz-dom as it parses a page -- tagged with
     /// the document id they belong to, since by the time one arrives the
     /// tab may have navigated away, closed, or been demoted (see
-    /// `TabManager::apply_resource`).
+    /// `TabManager::load_resource`/`resolve_layout_for_doc`).
     pub resources: Receiver<(usize, Resource)>,
 }
 
@@ -259,7 +259,8 @@ mod tests {
             .resources
             .recv_timeout(Duration::from_secs(10))
             .expect("no resource event received");
-        assert!(mgr.apply_resource(doc_id, resource));
+        assert!(mgr.load_resource(doc_id, resource));
+        assert!(mgr.resolve_layout_for_doc(doc_id));
 
         let after = mgr.tab(id).unwrap().paint().unwrap();
         assert_eq!(&after[..4], &[9, 9, 9, 255], "external stylesheet was not applied");
