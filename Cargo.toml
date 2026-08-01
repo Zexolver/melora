@@ -1,6 +1,6 @@
 [package]
 name = "melora"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -59,6 +59,21 @@ gosub_css3 = { git = "https://github.com/gosub-io/gosub-engine" }
 gosub_html5 = { git = "https://github.com/gosub-io/gosub-engine" }
 gosub_interface = { git = "https://github.com/gosub-io/gosub-engine" }
 gosub_shared = { git = "https://github.com/gosub-io/gosub-engine" }
+
+# Vendored, locally patched copies of two upstream crates -- see
+# vendor/blitz-dom and vendor/stylo_taffy's own doc comments (near the
+# `position:fixed`/`sticky` handling) for what's patched and why: upstream
+# stylo_taffy collapses CSS `position: fixed` to Taffy's `Absolute` (which
+# resolves against the nearest *positioned* ancestor, not the viewport) and
+# `position: sticky` to plain `Relative` (no stick-on-scroll at all) --
+# confirmed live on duckduckgo.com's fixed header/sidebar. `[patch.crates-io]`
+# transparently substitutes these for every crate in the dependency graph
+# that pulls the upstream version (including blitz-dom's own dependency on
+# stylo_taffy), so nothing else in this Cargo.toml needs to change.
+[patch.crates-io]
+blitz-dom = { path = "vendor/blitz-dom" }
+stylo_taffy = { path = "vendor/stylo_taffy" }
+blitz-paint = { path = "vendor/blitz-paint" }
 
 # Read by `cargo apk` (https://github.com/rust-mobile/cargo-apk) to build
 # and sign an APK from the `cdylib` target above -- see

@@ -723,8 +723,6 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b40d275ae1ea7c6b70233ebd6ed4278038ab4d00dcc1812bca14c9c3ab065116"
 dependencies = [
  "accesskit 0.17.1",
  "app_units",
@@ -789,8 +787,6 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5442484c1401ff358249d7390783c0bf3c71fd6968551fcc8c55809a0db47a87"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -4058,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "melora"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
@@ -6818,8 +6814,6 @@ checksum = "62601d73eb8743eaed1f227bde2374f672ae8de7db1fedcbe5aca055e3de566b"
 [[package]]
 name = "stylo_taffy"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4919f25cd55489a3d0a5b27b70c7a27d7671ab4ccb448a305102ce5f38618f6d"
 dependencies = [
  "stylo",
  "stylo_atoms",

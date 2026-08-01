@@ -412,6 +412,81 @@ gap that isn't.**
   conformance, not something to fake with page-specific workarounds in
   Melora's own code.
 
+**v0.1.7 dug into that "engine-capability gap" claim properly instead of
+stopping at a plausible-sounding correlation, and it turned out to be
+wrong about the cause but right that a real upstream fix was needed --
+just a much narrower and more tractable one than "improve Stylo's CSS
+conformance."**
+
+- **Stylo does fully resolve `var(--...)` custom properties -- the
+  v0.1.6 theory was never actually verified, just inferred from a high
+  usage count.** Reading `stylo-0.6.0`'s own source
+  (`custom_properties.rs`/`custom_properties_map.rs`) confirms it's a
+  complete implementation (this crate *is* Firefox's real CSS engine,
+  extracted), and `blitz-dom` drives it through the same
+  `style::traversal::recalc_style_at` cascade Servo's own layout engine
+  uses (`stylo.rs`'s `resolve_stylist`) -- no simplified/partial styling
+  pass, no bypass. The 686-`var()`-usages number from v0.1.6 was real
+  but not evidence of anything broken.
+- **The actual bug: `position: fixed`/`sticky` were flattened to
+  Taffy's `Absolute`/`Relative` at the Stylo→Taffy boundary
+  (`stylo_taffy`'s `convert.rs`), and Taffy's `Position::Absolute` only
+  ever resolves against a node's *immediate* layout parent -- there's
+  no "closest positioned ancestor" climbing the way real CSS does
+  (`perform_absolute_layout_on_absolute_children` and its flexbox/grid
+  equivalents each only place their own direct absolutely-positioned
+  children).** For `position: fixed` nested a few levels under
+  ordinary (`position: static`) wrapper `<div>`s -- extremely common
+  real markup, and exactly duckduckgo.com's header/sidebar -- that
+  meant it rendered relative to whichever div happened to be its
+  immediate parent instead of the viewport, and (separately) blitz-paint's
+  per-ancestor scroll-offset subtraction made it scroll away with the
+  page like an ordinary in-flow element instead of staying fixed.
+  Confirmed both effects live and with a hermetic regression test
+  (`engine.rs`'s `position_fixed_resolves_against_the_viewport_not_an_intervening_ancestor_and_ignores_scroll`)
+  that fails without the fix below and passes with it.
+- **The fix: `vendor/blitz-dom`, `vendor/blitz-paint`, and
+  `vendor/stylo_taffy`, patched, and wired in via
+  `[patch.crates-io]` in `Cargo.toml`.** This is real, `unsafe`-free
+  surgery on third-party rendering code, not a Melora-side workaround,
+  so it's worth being explicit about what changed and why patching
+  rather than reporting upstream and waiting was the right call here
+  (a working browser now beats a correct one later, and nothing rules
+  out upstreaming this afterward):
+  - `BaseDocument::reparent_fixed_positioned_descendants`
+    (`vendor/blitz-dom/src/document.rs`, called at the end of every
+    `resolve()`) splices every `position: fixed` element out of
+    wherever `collect_layout_children` naturally placed it and makes
+    it a direct layout/paint child of the root element instead --
+    reusing `layout_children`/`paint_children`, the *same* lists both
+    Taffy's layout and blitz-paint's paint traversal already walk, so
+    this one change fixes both the containing-block problem (Taffy now
+    resolves `Absolute` against the root, its only ancestor once
+    reparented) and, almost for free, the "used to be reachable through
+    a scrollable ancestor's paint recursion" half of the scroll
+    problem. Runs as a full pass over the stable DOM `children` list
+    (never mutated by layout) every single call rather than trying to
+    hook into `collect_layout_children`'s incremental damage-tracking,
+    specifically so it's trivially idempotent -- safe to call whether
+    or not that particular `resolve()` did a full or a damage-skipped
+    recompute.
+  - `blitz-paint/src/render.rs`'s `render_element` undoes the
+    document-level `viewport_scroll` offset specifically for
+    `position: fixed` nodes -- reparenting alone escapes *ancestor*
+    scroll containers, but the page's own top-level scroll is applied
+    once, unconditionally, at the very start of `paint_scene`
+    (`Point { x: -viewport_scroll.x, y: -viewport_scroll.y }`), which
+    would otherwise still drag a reparented-to-root fixed node along
+    with it.
+  - `position: sticky` is deliberately *not* attempted by this fix --
+    unlike `fixed`, its containing block is ordinary (it reserves
+    in-flow space and only clamps to an edge past a scroll threshold),
+    so it doesn't have the same wrong-ancestor bug; making it actually
+    stick would mean recomputing its offset live against current
+    scroll position on every paint, a materially bigger feature.
+    Tracked as a known gap, not silently left broken -- see "What's
+    still stubbed" below.
+
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 
 `TabManager` keeps an LRU order over open tabs and a fixed budget
@@ -835,24 +910,68 @@ Inline `<script>` tags now actually run, via [`boa_engine`](https://github.com/b
 `gosub_v8`, the other JS path on the table, is a huge C++ build and was
 ruled out as infeasible in this environment, let alone as a good fit for
 a self-contained binary). `src/js.rs`'s `JsEngine` wraps one `boa_engine::Context`
-per page and binds a deliberately small set of host functions:
+per page and binds a deliberately small, but for v0.1.7 no longer trivial,
+set of host bindings:
 
 - `console.log` / `console.warn` / `console.error` -- captured into a log
   (`JsEngine::take_console`), not printed anywhere yet.
 - `document.title = "..."` -- a property *setter only* (`ObjectInitializer::accessor`
   with no getter), captured into `JsEngine::title`.
+- `document.getElementById(id)` / `document.querySelector(selector)` --
+  real lookups against the live `blitz_dom` tree (`BaseDocument::query_selector`,
+  which runs Stylo's own selector matcher, so real CSS selectors work, not
+  a hand-rolled subset), returning an `Element` wrapping a node id, or
+  `null`.
+- On the `Element` that comes back: `.textContent` (get *and* set --
+  setting replaces all children with one new text node via
+  `DocumentMutator::remove_and_drop_all_children`/`create_text_node`/
+  `append_children`), `.getAttribute`/`.setAttribute`/`.removeAttribute`
+  (via `DocumentMutator::set_attribute`/`clear_attribute`), and
+  `.classList.contains`/`.add`/`.remove` (built purely in terms of
+  `getAttribute`/`setAttribute('class', ...)`, no separate token-list
+  machinery in `blitz_dom`).
 
-That's it. **This is not a DOM.** There's no `getElementById`, no element
-tree exposed to script, no event listeners, no `fetch`/`XMLHttpRequest`, no
-timers. A page that reads `document.title` back, queries the DOM, or relies
-on any other browser API will see `undefined`/throw, same as it would in
-an engine that never ran the script at all -- the difference this milestone
-makes is narrow and specific: simple scripts that log or set the page
-title (a surprisingly common real pattern -- SPA loading-state titles,
-analytics beacons that just log) now work, and it establishes the
-plumbing (a real embedded JS engine, wired into the page lifecycle) that
-a future, larger DOM-binding effort would build on rather than starting
-from zero.
+**This is real DOM access, not a shadow copy** -- `getElementById`/
+`querySelector` return handles into the actual page document, and setting
+`.textContent`/an attribute goes through `blitz_dom`'s own `DocumentMutator`
+(the same mutation API `main.rs`/`mutator.rs`'s other callers use), so it
+carries the right damage/restyle flags and is genuinely visible in the
+next `resolve()`/paint -- confirmed by `js.rs`'s
+`set_text_content_mutates_the_real_dom_and_is_visible_after_the_script_runs`
+test, which checks the change by reading the document back afterward, not
+just by asking the JS engine what it thinks happened.
+
+**Still deliberately narrow**, though: no `createElement`/tree-shape
+mutation beyond replacing an element's text, no event listeners (`click`,
+`DOMContentLoaded`, etc. -- scripts still only run once, synchronously,
+right after the initial parse), no `fetch`/`XMLHttpRequest`, no timers, no
+live `NodeList` (`querySelectorAll` isn't exposed, only the
+single-result `querySelector`, even though `BaseDocument::query_selector_all`
+exists and could back it). A page that relies on any of that still sees
+`undefined`/throws, same as before -- the difference is that the large,
+extremely common category of scripts that read/tweak a handful of
+elements after load (toggling a class, filling in text, checking an
+attribute) now actually works against the real page instead of universally
+failing.
+
+**The DOM-access mechanics, and why they need `unsafe`:** every DOM
+native function above needs to reach the live `HtmlDocument` the page
+owns, but Boa's native-function closures must be `'static` and can't
+borrow it directly. `JsEngine::run_with_document` (the entry point
+`PageEngine::from_html`'s script runner now uses instead of plain `run`)
+stashes the document's address as a raw pointer in the same `HostState`
+the console/title bindings already share, for the duration of that one
+call only -- a drop guard clears it immediately after, even across a
+panic mid-script. This is sound specifically because script execution in
+this codebase is fully synchronous end to end (no timers, no promises, no
+re-entrant `eval`), so nothing can observe or dereference the pointer
+outside the dynamic extent of the `run_with_document` call where the
+document is guaranteed to be the one live, uniquely-borrowed value it
+points to -- pinned down directly by
+`document_pointer_is_cleared_after_run_with_document_returns` in
+`src/js.rs`, and by every DOM-native call raising `undefined`/`null`
+rather than touching anything when no document is mounted
+(`dom_natives_without_a_mounted_document_quietly_return_null_rather_than_throwing`).
 
 **Where scripts run:** `PageEngine::from_html` walks the parsed document
 (`collect_inline_scripts`, a stack-based pre-order DFS from the root,
@@ -937,19 +1056,36 @@ below, which is where actual, intentional ad-blocking would have to live.
 
 ## What's still stubbed, and why
 
-- **JavaScript is real but narrow.** See the JavaScript section above --
-  `console`/`document.title` only, no DOM API, no events, no timers, no
-  network from script.
+- **JavaScript's DOM access is real but still narrow.** See the
+  JavaScript section above -- `getElementById`/`querySelector`,
+  `textContent`, attributes, and `classList` all touch the real
+  document as of v0.1.7, but there's still no `createElement`/tree
+  mutation beyond text, no event listeners, no timers, no network from
+  script, and no `querySelectorAll`/live `NodeList`.
 - **The disk swap tier never reclaims space within a run.** See the disk
   swap tier section above -- append-only by design, deleted whole on
   exit; a real free-list is future work if it ever matters in practice.
 - **No extension system of any kind.** No content-blocking, no
   WebExtensions compatibility, nothing. See Roadmap.
-- **CSS conformance is incomplete for real, modern pages.** See the
-  Android section's duckduckgo.com writeup above -- fetching and
-  applying a page's real CSS isn't the gap, Stylo/Taffy actually
-  implementing enough of it (heavy `var(--...)` custom-property usage
-  especially) to lay a complex real page out correctly is.
+- **`position: sticky` doesn't stick.** See the Android section's
+  v0.1.7 writeup below -- `position: fixed` was a wrong-containing-block
+  bug with a real, now-fixed answer; `sticky` is a materially bigger
+  feature (its offset has to be recomputed live against current scroll
+  position, not just resolved once at layout time) and is left as a
+  known gap rather than attempted half-right. It currently behaves like
+  plain `position: relative` -- in the correct place in flow, just never
+  clamping to an edge on scroll.
+- **Remaining CSS conformance gaps for real, modern pages are real but
+  much narrower than first thought.** The v0.1.6 writeup here claimed
+  Stylo doesn't fully resolve CSS custom properties (`var(--...)`) --
+  that turned out to be wrong (see the v0.1.7 section below); Stylo's
+  cascade is Firefox's real implementation and handles them fully.
+  What's actually still missing/simplified in `blitz-dom`/`stylo_taffy`/
+  Taffy: CSS container queries (explicitly disabled, not implemented --
+  `stylo.rs`'s `query_container_size`), CSS animations/transitions
+  (`animation_rule`/`transition_rule` always return `None`), and a few
+  narrower layout-property gaps (`flex-basis: content`, `display:
+  contents`, subgrid/masonry).
 
 ## Roadmap (rough order)
 

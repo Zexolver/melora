@@ -91,7 +91,7 @@ impl PageEngine {
         // more than a bad stylesheet does, hence the same catch_unwind
         // treatment as layout above.
         let (js_title, console_log) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inline_scripts(&document)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inline_scripts(&mut document)))
                 .unwrap_or_default();
 
         Self { document, viewport, base_url: Url::parse(url).ok(), js_title, console_log }
@@ -259,17 +259,20 @@ fn collect_inline_scripts(document: &HtmlDocument) -> Vec<String> {
 }
 
 /// Runs every inline script found in `document` against one shared
-/// `JsEngine`, returning the final `document.title` override (if any
+/// `JsEngine`, with `document` itself mounted (see
+/// `JsEngine::run_with_document`) so `document.getElementById`/
+/// `querySelector` and the elements they return operate on the real page,
+/// not a shadow copy. Returns the final `document.title` override (if any
 /// script set one) and the combined console log. Skips constructing a JS
 /// engine at all for the common case of a script-less page.
-fn run_inline_scripts(document: &HtmlDocument) -> (Option<String>, Vec<String>) {
+fn run_inline_scripts(document: &mut HtmlDocument) -> (Option<String>, Vec<String>) {
     let scripts = collect_inline_scripts(document);
     if scripts.is_empty() {
         return (None, Vec::new());
     }
     let mut js = crate::js::JsEngine::new();
     for script in &scripts {
-        js.run(script);
+        js.run_with_document(script, document);
     }
     (js.title(), js.take_console())
 }
@@ -350,6 +353,45 @@ mod tests {
         assert!(
             differing > 1000,
             "expected scrolling to noticeably change the rendered page, only {differing} bytes differed"
+        );
+    }
+
+    /// Regression test for the real duckduckgo.com header/sidebar bug:
+    /// `position: fixed` nested under an ordinary (`position: static`)
+    /// wrapper was rendering relative to that wrapper instead of the
+    /// viewport, and scrolled away like an in-flow element instead of
+    /// staying put -- see
+    /// `BaseDocument::reparent_fixed_positioned_descendants`'s doc
+    /// comment (vendor/blitz-dom/src/document.rs) for the root cause and
+    /// fix. `#fixed` sits inside a `position: relative` wrapper offset
+    /// 50px from the top-left by margin; if it were (wrongly) resolving
+    /// against that wrapper as its containing block, its `top:0; left:0`
+    /// inset would land it at canvas (50, 50), not (0, 0).
+    #[test]
+    fn position_fixed_resolves_against_the_viewport_not_an_intervening_ancestor_and_ignores_scroll() {
+        let html = "<html><body style=\"margin:0;\">\
+             <div style=\"position:relative; margin-left:50px; margin-top:50px;\">\
+             <div id=\"fixed\" style=\"position:fixed; top:0; left:0; width:10px; height:10px; \
+             background-color:rgb(9,9,9);\"></div>\
+             </div>\
+             <div style=\"height:2000px;\"></div>\
+             </body></html>";
+        let mut engine = PageEngine::from_html(html, BASE, (100, 100), None);
+
+        let before_scroll = engine.paint().unwrap();
+        assert_eq!(
+            &before_scroll[..4],
+            &[9, 9, 9, 255],
+            "fixed element should render at the viewport's top-left corner, \
+             not offset by its position:relative ancestor's margin"
+        );
+
+        engine.scroll_by(0.0, -500.0);
+        let after_scroll = engine.paint().unwrap();
+        assert_eq!(
+            &after_scroll[..4],
+            &[9, 9, 9, 255],
+            "fixed element should stay pinned to the viewport across scrolling"
         );
     }
 
