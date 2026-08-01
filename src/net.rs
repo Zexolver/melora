@@ -36,6 +36,28 @@ impl NavIntent {
         }
     }
 
+    /// Replaces this intent's target string, keeping its variant. Used by
+    /// `start_load` to swap the raw, possibly-schemeless text the user
+    /// typed (e.g. `"duckduckgo.com"`) for the fully resolved absolute URL
+    /// `resolve_typed_url` already computed for the fetch itself -- see its
+    /// call site for why this matters: `Navigate`'s string becomes the
+    /// fetched document's own base URL (`PageEngine::from_html`'s `url`
+    /// parameter), and blitz-dom needs a real absolute URL there to resolve
+    /// any relative `<link>`/`<script>` reference on the page at all. Only
+    /// `Navigate`'s string is ever actually read downstream (`apply`,
+    /// below) -- `Reload`/`Back`/`Forward`/`Wake` look their real target up
+    /// from the tab's own history instead -- but resolving one more time is
+    /// harmless for them too.
+    pub fn with_target(self, resolved: String) -> Self {
+        match self {
+            NavIntent::Navigate(_) => NavIntent::Navigate(resolved),
+            NavIntent::Reload(_) => NavIntent::Reload(resolved),
+            NavIntent::Back(_) => NavIntent::Back(resolved),
+            NavIntent::Forward(_) => NavIntent::Forward(resolved),
+            NavIntent::Wake(_) => NavIntent::Wake(resolved),
+        }
+    }
+
     pub fn apply(&self, mgr: &mut TabManager, id: TabId, html: &str) {
         match self {
             NavIntent::Navigate(u) => mgr.navigate(id, u.clone(), html),

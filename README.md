@@ -110,20 +110,24 @@ This is an early scaffold, not a daily driver yet. What works today:
   live: a page whose script sets `document.title = "Changed by JS"` shows
   that title in the real tab strip, not just in a unit test. See
   ARCHITECTURE.md for the exact scope and why it's drawn there.
-- **Builds for, and runs on, Android** (`aarch64-linux-android`) with no
-  UI code changes -- verified end to end, including on a real running
-  emulator: a signed `.apk` installs, launches, renders the real chrome,
-  fetches real pages over the network, and its tabs survive a real app
-  restart (the same session-restore prompt desktop gets). Several real
-  bugs were found and fixed along the way -- native-tls has no OpenSSL to
-  link against on Android; a JDK 21 + Android build-tools 34 combination
-  hits a known Slint bug in its dexer step; a launch-time crash from
-  Android having no writable temp dir the way desktop does; and
-  `Cargo.toml`'s declared app label/SDK versions were silently being
-  ignored due to a config-schema mismatch -- see ARCHITECTURE.md for all
-  of them. Still open: the chrome renders partly under the system status
-  bar (cosmetic, needs inset handling), and the APK is debug-signed for
-  sideloading, not release-signed for the Play Store.
+- **Builds for, and runs on, Android** (`aarch64-linux-android`) with the
+  same UI code as desktop -- verified end to end on a real running
+  emulator: a signed `.apk` installs, launches, updates in place across
+  releases (a stable committed signing key, not a randomly-regenerated
+  one -- see ARCHITECTURE.md), and renders real pages fetched live over
+  the network, including a real, non-trivial site (duckduckgo.com's
+  actual homepage, not a fallback page). A real chrome, purpose-fit for
+  a phone screen: no more status-bar overlap, pill-shaped tabs/buttons
+  sized for touch, an address bar that behaves like Fennec's (tapping it
+  doesn't select the whole URL), and a compact overflow menu instead of
+  a toolbar row that ran wider than the screen. A long list of real bugs
+  were found and fixed getting here, from native-tls needing OpenSSL
+  vendored in, to a launch-time crash from Android having no writable
+  temp dir, to Melora's own address-bar handling silently dropping the
+  URL scheme before it ever reached the page's own base URL -- see
+  ARCHITECTURE.md's Android section for the full, evidence-backed list.
+  Still open: the APK is debug-signed for sideloading, not release-signed
+  for the Play Store.
 
 All of the above was checked against a real running instance under Xvfb
 (driven with `xdotool`, screenshotted with `xwd`), not just unit-tested —

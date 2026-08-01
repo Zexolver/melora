@@ -322,6 +322,57 @@ unchanged), but the Activity stays open and visible, the process
 survives, and the tab shows the fallback message instead of the app
 disappearing.
 
+**The v0.1.4 fix above stopped the crash, but duckduckgo.com still
+didn't actually render -- it just failed gracefully. The real bug,
+found for v0.1.5, was Melora's own code, not blitz-dom's.** A temporary
+debug `eprintln!` in `PageEngine::from_html` proved it was being called
+with `url="duckduckgo.com"` -- the raw text from the address bar, with
+no scheme at all -- instead of the resolved `https://duckduckgo.com/`.
+`start_load` (`src/lib.rs`) already called `net::resolve_typed_url` to
+get a real absolute `Url` for the fetch itself, but the `NavIntent` sent
+alongside it still carried the original unresolved string, which is
+what later becomes the fetched document's own base URL
+(`TabManager::navigate` -> `PageEngine::from_html`'s `url` parameter).
+A document whose base URL has no scheme can't resolve *any* relative
+`<link>`/`<script>` reference -- not a page bug, not a blitz-dom bug,
+just Melora handing the engine a broken base URL for every single
+navigation that didn't already have an explicit scheme typed in. Fixed
+by adding `NavIntent::with_target` (`src/net.rs`) and calling it in
+`start_load` right after resolution succeeds, so the intent's target
+gets swapped for the real resolved URL before the fetch is even sent.
+Verified live: duckduckgo.com now renders its real homepage --
+navigation, search box, logo -- not just the fallback page, with zero
+panics.
+
+**A real UI redesign, also for v0.1.5, prompted by "the UI feels
+clunky/not modern".** Three concrete, live-verified changes:
+
+- **The status-bar overlap (a known gap since the Android section
+  above was first written) is fixed.** `Window.safe-area-insets` turns
+  out to already be populated automatically by Slint's Android backend
+  (`androidwindowadapter.rs`'s `set_window_item_safe_area`) -- no custom
+  `android:theme` or manual `WindowInsets` handling needed, just
+  `padding-top: root.safe-area-insets.top` on the root layout. Zero on
+  desktop, so this is a no-op there.
+- **The address bar (`ui/melora.slint`'s `AddressBar` component) replaces
+  `std-widgets`' `LineEdit`** with a raw `TextInput`, specifically so
+  focus doesn't select the whole URL -- Fennec (old Firefox for
+  Android)'s address bar just drops a cursor where you tapped, matched
+  here by calling `TextInput`'s own `clear-selection()` on focus-in.
+  `LineEdit` doesn't expose enough of `TextInput`'s API to do this
+  without dropping down to the raw element.
+- **Pill-shaped tabs/buttons, bigger 40px touch targets, and a
+  refreshed near-black palette**, replacing the flatter, lower-contrast
+  chrome the earlier screenshots in this doc show. Live-testing this
+  caught a real layout bug before it shipped: the bigger nav-bar
+  buttons made the row wider than an actual phone screen, cutting the
+  Hibernate button off entirely -- fixed by moving Settings and
+  Hibernate off the always-visible row into a compact overflow menu
+  (a plain `Rectangle`-built three-dot icon, not a Unicode glyph -- see
+  the reload-icon story above for why that's not a coincidence) behind
+  a single button, the same fix real mobile browsers make for the same
+  reason.
+
 ## Tab compression (the "hundreds of tabs, low RAM" feature)
 
 `TabManager` keeps an LRU order over open tabs and a fixed budget

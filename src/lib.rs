@@ -179,6 +179,16 @@ fn start_load(
     match net::resolve_typed_url(&target) {
         Ok(url) => {
             window.set_status_text(format!("Loading {target}…").into());
+            // `intent`'s own target string is what ends up as the fetched
+            // page's base URL (see `NavIntent::with_target`'s doc comment)
+            // -- swapping it for the resolved absolute `url` here, rather
+            // than leaving whatever raw text the user typed (which may
+            // have no scheme at all, e.g. "duckduckgo.com"), is what lets
+            // the page's own relative <link>/<script> references resolve
+            // at all instead of hitting an unresolvable base. Verified
+            // live: this is what actually made duckduckgo.com's real
+            // content render for the first time, not just fail gracefully.
+            let intent = intent.with_target(url.to_string());
             network.fetch(id, url, intent);
         }
         Err(message) => {
